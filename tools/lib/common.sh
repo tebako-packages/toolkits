@@ -101,10 +101,12 @@ asset_field() {
 }
 
 # asset_licenses RECIPE PLATFORM — the archive-carried license members,
-# one per line (empty for bare-binary assets).
+# one per line (empty for bare-binary assets). binmode: ucrt64 ruby text
+# mode would emit \r\n and poison the caller's `read -r` loop (the same
+# defense as tools/stage's read-back).
 asset_licenses() {
   "$HERE/recipe_query" -o "$1" "upstream.assets.$2.licenses" \
-    | ruby -rjson -e 'JSON.parse(STDIN.read).each { |g| puts g }'
+    | ruby -rjson -e '$stdout.binmode; JSON.parse(STDIN.read).each { |g| puts g }'
 }
 
 # cross_check_sums RECIPE PLATFORM FILE EXPECTED_SHA256 DESTDIR
