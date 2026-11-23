@@ -33,19 +33,10 @@ jobs:
     outputs:
       published: ${{ steps.gate.outputs.published }}
       release: ${{ steps.pins.outputs.release }}
+      pins: ${{ steps.pins.outputs.pins }}
       jq_version: ${{ steps.pins.outputs.jq_version }}
       yq_version: ${{ steps.pins.outputs.yq_version }}
       rg_version: ${{ steps.pins.outputs.rg_version }}
-      pin_tebako_macos_arm64: ${{ steps.pins.outputs.pin_tebako_macos_arm64 }}
-      pin_shim_macos_arm64: ${{ steps.pins.outputs.pin_shim_macos_arm64 }}
-      pin_tebako_macos_x86_64: ${{ steps.pins.outputs.pin_tebako_macos_x86_64 }}
-      pin_shim_macos_x86_64: ${{ steps.pins.outputs.pin_shim_macos_x86_64 }}
-      pin_tebako_linux_gnu_x86_64: ${{ steps.pins.outputs.pin_tebako_linux_gnu_x86_64 }}
-      pin_shim_linux_gnu_x86_64: ${{ steps.pins.outputs.pin_shim_linux_gnu_x86_64 }}
-      pin_tebako_linux_gnu_arm64: ${{ steps.pins.outputs.pin_tebako_linux_gnu_arm64 }}
-      pin_shim_linux_gnu_arm64: ${{ steps.pins.outputs.pin_shim_linux_gnu_arm64 }}
-      pin_tebako_windows_ucrt64: ${{ steps.pins.outputs.pin_tebako_windows_ucrt64 }}
-      pin_shim_windows_ucrt64: ${{ steps.pins.outputs.pin_shim_windows_ucrt64 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: pins
@@ -55,7 +46,7 @@ jobs:
         # a drifted recipe is a named error here, never a mixed fetch).
         run: |
           set -euo pipefail
-          ruby -ryaml -e '
+          ruby -ryaml -rjson -e '
             recipes = Dir.glob("recipes/*.yml").sort.map { |f| YAML.load_file(f) }
             tools = recipes.map { |r| r.fetch("tools") }.uniq
             abort "NAMED FAILURE: toolchain pin drift across recipes" unless tools.length == 1
@@ -67,12 +58,11 @@ jobs:
               v = r.fetch("upstream").fetch("version")
               out.puts "#{name == "ripgrep" ? "rg" : name}_version=#{v}"
             end
+            pins = {}
             tools.fetch("tebako").fetch("sha256").each do |infix, sha|
-              key = infix.tr("-", "_")
-              shim = tools.fetch("shim").fetch("sha256").fetch(infix)
-              out.puts "pin_tebako_#{key}=#{sha}"
-              out.puts "pin_shim_#{key}=#{shim}"
+              pins[infix] = { "tebako" => sha, "shim" => tools.fetch("shim").fetch("sha256").fetch(infix) }
             end
+            out.puts "pins=#{JSON.generate(pins)}"
           '
       # The gate is the shared composite action (tebako-packages/index) —
       # never re-inline a per-repo probe here. One probe per tool row; a
@@ -122,12 +112,9 @@ jobs:
           - { triplet: x86_64-windows-ucrt, os: windows-latest, infix: windows-ucrt64 }
     runs-on: ${{ matrix.os }}
     env:
-      # A scratch home per leg: the install below is the full cold path —
-      # no runtimes, no payloads, no shims pre-seeded.
-      TEBAKO_HOME: ${{ runner.temp }}/tebako-home
       TEBAKO_RELEASE: ${{ needs.gate.outputs.release }}
-      TEBAKO_SHA256: ${{ needs.gate.outputs[format('pin_tebako_{0}', replace(matrix.infix, '-', '_'))] }}
-      SHIM_SHA256: ${{ needs.gate.outputs[format('pin_shim_{0}', replace(matrix.infix, '-', '_'))] }}
+      TEBAKO_SHA256: ${{ fromJSON(needs.gate.outputs.pins)[matrix.infix].tebako }}
+      SHIM_SHA256: ${{ fromJSON(needs.gate.outputs.pins)[matrix.infix].shim }}
       JQ_VERSION: ${{ needs.gate.outputs.jq_version }}
       YQ_VERSION: ${{ needs.gate.outputs.yq_version }}
       RG_VERSION: ${{ needs.gate.outputs.rg_version }}
@@ -166,8 +153,12 @@ jobs:
         # registry's sha256 pin AND the signature the publish stamped
         # (spec 09 §9's zero-interaction rule — the tamatebako root public
         # key is embedded in the CLI; no key import step rides here).
+        # A scratch TEBAKO_HOME per leg (the full cold path — no runtimes,
+        # no payloads, no shims pre-seeded): the runner context is not
+        # available to job env, so every post-download step exports it.
         run: |
           set -euo pipefail
+          export TEBAKO_HOME="$RUNNER_TEMP/tebako-home"
           tebako add-registry tfs:github:tebako-packages/toolkits
           tebako install "jq@$JQ_VERSION"
           tebako install "yq@$YQ_VERSION"
@@ -178,6 +169,7 @@ jobs:
       - name: Assert the store holds one image + trust anchor per tool
         run: |
           set -euo pipefail
+          export TEBAKO_HOME="$RUNNER_TEMP/tebako-home"
           for payload in jq yq ripgrep; do
             n="$(ls "$TEBAKO_HOME/payloads/$payload"/*.tfs 2>/dev/null | wc -l | tr -d ' ')"
             [ "$n" = "1" ] || { echo "::error::$payload has $n images in store (expected 1)"; exit 1; }
@@ -191,6 +183,7 @@ jobs:
         # link, spec 07 §2.1, first hit wins).
         run: |
           set -euo pipefail
+          export TEBAKO_HOME="$RUNNER_TEMP/tebako-home"
           TEBAKO_JQ_VERSION="$JQ_VERSION" jq --version | grep -F "jq-$JQ_VERSION"
           TEBAKO_JQ_VERSION="$JQ_VERSION" jq -n '{ok:true}' | grep -F '"ok": true'
           echo "jq OK: $JQ_VERSION through the shim"
@@ -198,6 +191,7 @@ jobs:
       - name: yq runs through its shim
         run: |
           set -euo pipefail
+          export TEBAKO_HOME="$RUNNER_TEMP/tebako-home"
           TEBAKO_YQ_VERSION="$YQ_VERSION" yq --version | grep -F "version v$YQ_VERSION"
           TEBAKO_YQ_VERSION="$YQ_VERSION" yq -n '.ok = true' | grep -F 'ok: true'
           echo "yq OK: $YQ_VERSION through the shim"
@@ -207,6 +201,7 @@ jobs:
         # pin uppercases the argv0 (TEBAKO_RG_VERSION).
         run: |
           set -euo pipefail
+          export TEBAKO_HOME="$RUNNER_TEMP/tebako-home"
           TEBAKO_RG_VERSION="$RG_VERSION" rg --version | head -1 | grep -F "ripgrep $RG_VERSION"
           printf 'needle\n' | TEBAKO_RG_VERSION="$RG_VERSION" rg needle | grep -F 'needle'
           echo "rg OK: $RG_VERSION through the shim"
