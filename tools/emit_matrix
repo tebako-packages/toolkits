@@ -1,0 +1,35 @@
+#!/usr/bin/env ruby
+# emit_matrix — emit the GitHub Actions build matrix for the feedstock.
+# Usage: ruby tools/emit_matrix [RECIPES_GLOB]
+# Prints one JSON object: {"include":[{recipe, name, version, platform, runner}, ...]}
+# One leg per (recipe × platform) across the feedstock's recipes. Unknown
+# platforms are a hard error — per-platform handling is a recipe feature,
+# not a hack (docs/conventions.md in tebako-packages/index).
+
+require 'yaml'
+require 'json'
+
+RUNNERS = {
+  'x86_64-linux-gnu' => 'ubuntu-22.04',
+  'aarch64-linux-gnu' => 'ubuntu-22.04-arm',
+  'aarch64-macos'    => 'macos-15',
+  'x86_64-macos'     => 'macos-15-intel',
+  'x86_64-windows-ucrt' => 'windows-latest',
+}.freeze
+
+recipes = Dir.glob(ARGV[0] || 'recipes/*.yml').sort
+abort "emit_matrix: no recipes matched" if recipes.empty?
+
+legs = []
+recipes.each do |path|
+  recipe = YAML.load_file(path)
+  name = recipe['name'] or abort "emit_matrix: #{path}: name missing"
+  version = recipe.dig('upstream', 'version') or abort "emit_matrix: #{path}: upstream.version missing"
+  platforms = recipe['platforms'] or abort "emit_matrix: #{path}: platforms missing"
+  platforms.each do |triplet|
+    runner = RUNNERS[triplet] or abort "emit_matrix: no runner mapped for platform '#{triplet}'"
+    legs << { recipe: path, name: name, version: version, platform: triplet, runner: runner }
+  end
+end
+
+puts JSON.generate(include: legs)

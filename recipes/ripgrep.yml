@@ -1,0 +1,96 @@
+# Feedstock recipe for ripgrep — a REPACK feedstock: upstream's official
+# per-target archives (static musl builds on linux; OS-library-only builds
+# on macOS/windows — verified, see README's provenance table) are fetched
+# (sha256-pinned, cross-checked against upstream's per-asset .sha256
+# sidecars), staged, and pressed as a .tfs payload. Nothing compiles on
+# any leg.
+name: "ripgrep"
+kind: toolkit
+summary: "ripgrep (rg) — the line-oriented recursive search tool (upstream static build)"
+
+upstream:
+  version: "16.0.0"
+  homepage: "https://github.com/BurntSushi/ripgrep"
+  # Dual-licensed MIT / Unlicense; both notices (plus COPYING) ride the
+  # payload from the archive itself (the per-asset licenses: members).
+  license: "MIT OR Unlicense"
+  release: "https://github.com/BurntSushi/ripgrep/releases/download/16.0.0"
+  # Upstream publishes one sha256 sidecar per asset (<asset>.sha256). The
+  # per-triplet pin below is the trust anchor; build cross-checks it
+  # against that sidecar at fetch time.
+  sums: {format: "sidecar"}
+  # Per-tebako-triplet upstream asset (an archive) + its sha256. archive:
+  # is the member format; member: names the binary inside; licenses: names
+  # the license members staged beside it (archive-root-relative paths).
+  assets:
+    aarch64-macos:
+      file: "ripgrep-16.0.0-aarch64-apple-darwin.tar.gz"
+      sha256: "5a145656d5067144001bfce6648767fd3254599aa736f1ffdb7fb907760b8ca1"
+      archive: tar.gz
+      member: "ripgrep-16.0.0-aarch64-apple-darwin/rg"
+      licenses: ["ripgrep-16.0.0-aarch64-apple-darwin/COPYING", "ripgrep-16.0.0-aarch64-apple-darwin/LICENSE-MIT", "ripgrep-16.0.0-aarch64-apple-darwin/UNLICENSE"]
+    x86_64-macos:
+      file: "ripgrep-16.0.0-x86_64-apple-darwin.tar.gz"
+      sha256: "aa9183b0e0bfac03c5818895ad18b75001c402d230063898abfe5a58cd413caa"
+      archive: tar.gz
+      member: "ripgrep-16.0.0-x86_64-apple-darwin/rg"
+      licenses: ["ripgrep-16.0.0-x86_64-apple-darwin/COPYING", "ripgrep-16.0.0-x86_64-apple-darwin/LICENSE-MIT", "ripgrep-16.0.0-x86_64-apple-darwin/UNLICENSE"]
+    x86_64-linux-gnu:
+      file: "ripgrep-16.0.0-x86_64-unknown-linux-musl.tar.gz"
+      sha256: "54268ab4643c00a290a29b0086066d64b3f56236dd805ec64629a86f9bd29fd0"
+      archive: tar.gz
+      member: "ripgrep-16.0.0-x86_64-unknown-linux-musl/rg"
+      licenses: ["ripgrep-16.0.0-x86_64-unknown-linux-musl/COPYING", "ripgrep-16.0.0-x86_64-unknown-linux-musl/LICENSE-MIT", "ripgrep-16.0.0-x86_64-unknown-linux-musl/UNLICENSE"]
+    aarch64-linux-gnu:
+      file: "ripgrep-16.0.0-aarch64-unknown-linux-musl.tar.gz"
+      sha256: "374f1886be881e8e8683d7107278f7af1b6017fda75eb97de71f5783f42b0110"
+      archive: tar.gz
+      member: "ripgrep-16.0.0-aarch64-unknown-linux-musl/rg"
+      licenses: ["ripgrep-16.0.0-aarch64-unknown-linux-musl/COPYING", "ripgrep-16.0.0-aarch64-unknown-linux-musl/LICENSE-MIT", "ripgrep-16.0.0-aarch64-unknown-linux-musl/UNLICENSE"]
+    x86_64-windows-ucrt:
+      file: "ripgrep-16.0.0-x86_64-pc-windows-msvc.zip"
+      sha256: "f418ae83e63046a94a7b5f3a44bf3a169f66e689164856ecee02547131c73931"
+      archive: zip
+      member: "ripgrep-16.0.0-x86_64-pc-windows-msvc/rg.exe"
+      licenses: ["ripgrep-16.0.0-x86_64-pc-windows-msvc/COPYING", "ripgrep-16.0.0-x86_64-pc-windows-msvc/LICENSE-MIT", "ripgrep-16.0.0-x86_64-pc-windows-msvc/UNLICENSE"]
+
+build:
+  system: repack        # fetch upstream's verified static build → stage → image
+
+# Image tooling (every leg): the tfs CLI from the tamatebako/tebako
+# release — `tfs mkimage` (limnifs, the default tebako image format) is
+# the imager and the boot smoke's info/tree/extract reader. The asset
+# digests are pinned here (the repo's toolchain pin SSOT — the same
+# trust-anchor role as the upstream asset pins) and cross-checked against
+# the release's own SHA256SUMS at fetch time (lib/common.sh's download_tfs).
+tools:
+  repo: "tamatebako/tebako"
+  release: "v2.8.83"
+  sha256:
+    linux-gnu-x86_64: "126777314d562d74b8ff7aacc33256dc2fa0e248e7b6d914eac29679ddd728b2"
+    linux-gnu-arm64: "41472b8b936eb6c482bec4b595e8b80c21c6499492cf8d4128c980f362a4450c"
+    macos-arm64: "a8c5481736801f72cd9c3da648ec208601187ac4335e19086bb5ea28c203feed"
+    macos-x86_64: "5003bd83fe93a5e707bbb519ee78ec01008f44a2e0d5ba32cbc59a349f03e8e8"
+    windows-ucrt64: "a965052e5ccc6e9589b17b4004d3b645650fb08cd16e34bf9b0651d882d24fdf"
+
+platforms:
+  - x86_64-linux-gnu
+  - aarch64-linux-gnu
+  - aarch64-macos
+  - x86_64-macos
+  - x86_64-windows-ucrt
+
+provides:
+  executables:
+    # the windows image carries /bin/rg.exe (stage fills the suffix)
+    - {name: "rg", path: "/bin/rg", version: "16.0.0"}
+  libraries: []
+
+# The boot smoke's run contract (tools/boot_smoke): the packaged binary
+# runs from the extracted image and answers before any leg goes green.
+smoke:
+  version: {argv: ["--version"], expect: "ripgrep 16.0.0"}
+  functional: {argv: ["needle"], stdin: "a needle in a haystack\n", expect: "needle"}
+
+exec_tier: static         # linux legs are upstream's musl static builds; macOS/windows link OS libraries only (verified — see README's provenance table)
+exec_closure: []          # static tier

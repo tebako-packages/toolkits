@@ -1,0 +1,94 @@
+name: build-payload
+# Feedstock build: recipes → matrix build → boot-smoke → staged artifacts.
+# Conventions: docs/conventions.md in tebako-packages/index.
+#
+# This increment has NO publish leg: tag pushes, releases, registry rows,
+# and signing are the next increment (see README's roadmap). Nothing here
+# releases anything.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per branch/PR-head at a time: pushing to a branch with an open
+# PR would otherwise run every job twice (push + pull_request events);
+# a new run cancels the stale one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: emit
+    runs-on: ubuntu-24.04
+    outputs:
+      legs: ${{ steps.m.outputs.legs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: m
+        run: |
+          # The matrix is EMITTED from the recipes (YAML stays thin;
+          # logic lives in tools/). tools/emit_matrix emits one leg per
+          # (recipe × platform) across recipes/*.yml.
+          echo "legs=$(ruby tools/emit_matrix)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }} ${{ matrix.version }} (${{ matrix.platform }})
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.legs) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up MSys2 (repack tools only)
+        if: matrix.platform == 'x86_64-windows-ucrt'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: ucrt64
+          path-type: minimal
+          update: true
+          # NO toolchain — a repack leg never compiles. Only the msys-side
+          # tools the feedstock scripts call (tar, curl, unzip for the
+          # zip-carrying assets, git for the stage stamp) and the ucrt64
+          # ruby recipe_query runs on.
+          install: >-
+            git
+            tar
+            curl
+            unzip
+            mingw-w64-ucrt-x86_64-ruby
+      - name: Build ${{ matrix.name }} ${{ matrix.version }} (${{ matrix.platform }})
+        if: matrix.platform != 'x86_64-windows-ucrt'
+        run: tools/build "${{ matrix.recipe }}" "${{ matrix.version }}" "${{ matrix.platform }}"
+      - name: Build ${{ matrix.name }} ${{ matrix.version }} (${{ matrix.platform }}, ucrt64)
+        if: matrix.platform == 'x86_64-windows-ucrt'
+        # the matrix context is not available to step-level `shell`, so
+        # the windows leg gets its own step with the literal msys2 keyword
+        shell: msys2 {0}
+        run: tools/build "${{ matrix.recipe }}" "${{ matrix.version }}" "${{ matrix.platform }}"
+      - name: Boot-smoke
+        # Hard rule (docs/conventions.md): the packaged tool runs from the
+        # image (the recipe's smoke: contract) before any leg goes green.
+        if: matrix.platform != 'x86_64-windows-ucrt'
+        run: tools/boot_smoke "out/${{ matrix.name }}/${{ matrix.platform }}" "${{ matrix.recipe }}"
+      - name: Boot-smoke (ucrt64)
+        if: matrix.platform == 'x86_64-windows-ucrt'
+        shell: msys2 {0}
+        run: tools/boot_smoke "out/${{ matrix.name }}/${{ matrix.platform }}" "${{ matrix.recipe }}"
+      - name: Stage artifact
+        if: matrix.platform != 'x86_64-windows-ucrt'
+        run: tools/stage "out/${{ matrix.name }}/${{ matrix.platform }}" "${{ matrix.platform }}" "${{ matrix.recipe }}"
+      - name: Stage artifact (ucrt64)
+        if: matrix.platform == 'x86_64-windows-ucrt'
+        shell: msys2 {0}
+        run: tools/stage "out/${{ matrix.name }}/${{ matrix.platform }}" "${{ matrix.platform }}" "${{ matrix.recipe }}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.name }}-${{ matrix.platform }}
+          retention-days: 2
+          path: dist/

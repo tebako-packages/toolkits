@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# tools/boot_smoke — run the packaged tool from a built payload image.
+#
+#   tools/boot_smoke OUT_DIR [RECIPE]
+#
+# OUT_DIR is one build leg's out/<name>/<platform> directory (must
+# contain payload.tfs and the leg's verified tfs CLI in tools/).
+#
+# Mode: extract-and-run. The smoke extracts the image with the leg's
+# verified tfs CLI (the same binary on every platform — info/tree/extract
+# subcommands) and runs the binary natively per the recipe's smoke:
+# block. That is exactly the static binary the payload interposes on;
+# the exec shim itself is out of smoke scope. The tfs CLI restores image
+# permission bits on extract (windows executability rides the .exe
+# extension, not mode bits), so no mode repair is needed after
+# extraction.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/lib/common.sh"
+
+OUT="${1:?usage: tools/boot_smoke OUT_DIR [RECIPE]}"
+RECIPE="${2:-recipes/jq.yml}"
+IMAGE="$OUT/payload.tfs"
+PLATFORM="${OUT%/}"; PLATFORM="${PLATFORM##*/}"   # out/<name>/<platform>
+READER="$(image_reader "$PLATFORM" "$OUT")"
+EXE_SUFFIX="$(exe_suffix_for "$PLATFORM")"
+
+[ -f "$IMAGE" ]  || { echo "boot_smoke: no payload image at $IMAGE" >&2; exit 1; }
+[ -x "$READER" ] || { echo "boot_smoke: no verified image reader at $READER" >&2; exit 1; }
+
+EXE_NAME="$("$HERE/recipe_query" "$RECIPE" provides.executables.0.name)"
+EXE_PATH="$("$HERE/recipe_query" "$RECIPE" provides.executables.0.path)"
+EXE_VER="$("$HERE/recipe_query" "$RECIPE" provides.executables.0.version)"
+
+echo "boot_smoke: mode=extract-and-run reader=$(basename "$READER") image=$IMAGE exe=$EXE_PATH$EXE_SUFFIX@$EXE_VER"
+
+echo "--- image info ---"
+"$READER" info "$IMAGE"
+echo "--- image tree ---"
+"$READER" tree "$IMAGE"
+
+# The extraction dir stays INSIDE the leg's out/ tree: a relative path
+# works for the msys-native reader AND for tfs.exe (a native windows
+# binary that cannot resolve msys-virtual absolute paths like /tmp/...).
+TMP="$(mktemp -d "$OUT/smoke.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+"$READER" extract -d "$TMP" "$IMAGE" >/dev/null
+
+# The tfs CLI restores image permission bits on extract; the existence
+# checks below are the guard (a mode-restoring reader needs no repair
+# step).
+N_EXES=$("$HERE/recipe_query" "$RECIPE" provides.executables | ruby -rjson -e 'puts JSON.parse(STDIN.read).length')
+for i in $(seq 0 $((N_EXES - 1))); do
+  p="$("$HERE/recipe_query" "$RECIPE" "provides.executables.$i.path")$EXE_SUFFIX"
+  [ -f "$TMP$p" ] || { echo "boot_smoke: FAIL — $p missing from image" >&2; exit 1; }
+done
+
+# the license notices ride the payload (the repack license contract)
+NAME="$("$HERE/recipe_query" "$RECIPE" name)"
+[ -d "$TMP/share/licenses/$NAME" ] || {
+  echo "boot_smoke: FAIL — no license notices at /share/licenses/$NAME in image" >&2; exit 1; }
+ls -la "$TMP/share/licenses/$NAME"
+
+BIN="$TMP$EXE_PATH$EXE_SUFFIX"
+[ -x "$BIN" ] || { echo "boot_smoke: FAIL — $EXE_PATH$EXE_SUFFIX not executable in image" >&2; exit 1; }
+
+# the recipe's smoke: contract — argv vectors are YAML lists (one
+# element per line here; CLI flags never carry newlines)
+smoke_argv() {  # $1 = smoke.<key>.argv
+  "$HERE/recipe_query" "$RECIPE" "$1" | ruby -rjson -e 'JSON.parse(STDIN.read).each { |a| puts a }'
+}
+V_EXPECT="$("$HERE/recipe_query" "$RECIPE" smoke.version.expect)"
+V_ARGV=()
+while IFS= read -r a; do V_ARGV+=("$a"); done < <(smoke_argv smoke.version.argv)
+F_EXPECT="$("$HERE/recipe_query" "$RECIPE" smoke.functional.expect)"
+F_ARGV=()
+while IFS= read -r a; do F_ARGV+=("$a"); done < <(smoke_argv smoke.functional.argv)
+F_STDIN="$("$HERE/recipe_query" -o "$RECIPE" smoke.functional.stdin)"
+[ "$F_STDIN" = "[]" ] && F_STDIN=""
+
+echo "--- run: $EXE_PATH$EXE_SUFFIX ${V_ARGV[*]} (from extracted image) ---"
+# Capture the FULL output first: piping the child through `head -1`
+# breaks on windows (no SIGPIPE — head exits, the child's next write
+# fails, and pipefail then kills the step before any assertion runs).
+RAW="$("$BIN" "${V_ARGV[@]}" 2>&1)"
+echo "$RAW"
+VER_OUT="$(printf '%s\n' "$RAW" | head -1)"
+case "$VER_OUT" in
+  *"$V_EXPECT"*) : ;;
+  *) echo "boot_smoke: FAIL — version output does not contain '$V_EXPECT'" >&2; exit 1 ;;
+esac
+
+echo "--- run: $EXE_PATH$EXE_SUFFIX ${F_ARGV[*]} (functional) ---"
+RUN_OUT="$(printf '%s' "$F_STDIN" | "$BIN" "${F_ARGV[@]}" 2>&1)"
+echo "$RUN_OUT"
+case "$RUN_OUT" in
+  *"$F_EXPECT"*) : ;;
+  *) echo "boot_smoke: FAIL — functional output does not contain '$F_EXPECT'" >&2; exit 1 ;;
+esac
+
+echo "boot_smoke: PASS ($EXE_NAME $EXE_VER)"
