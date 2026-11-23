@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# tools/build — build one (recipe × version × platform) leg of a repack
+# feedstock.
+#
+#   tools/build [RECIPE] VERSION PLATFORM
+#
+# fetch upstream's static build (sha256-verified against the recipe pin,
+# cross-checked against upstream's own published sums) → stage the binary
+# + its license notice(s) into the payload root → pack the staging tree
+# as a limnifs/tfs image with the leg's pinned tfs CLI (every download
+# sha256-verified). Nothing compiles on any leg.
+#
+# Outputs (all under out/<name>/<platform>/):
+#   payload.tfs   the packed staging tree
+#   root/         the staging tree itself (kept for inspection)
+#   tools/        the leg's verified tfs CLI (imager + smoke reader)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/lib/common.sh"
+
+RECIPE="recipes/jq.yml"
+case "${1:-}" in
+  *.yml|*.yaml) RECIPE="$1"; shift ;;
+esac
+VERSION="${1:?usage: tools/build [RECIPE] VERSION PLATFORM}"
+PLATFORM="${2:?usage: tools/build [RECIPE] VERSION PLATFORM}"
+
+NAME="$("$HERE/recipe_query" "$RECIPE" name)"
+UP_VER="$("$HERE/recipe_query" "$RECIPE" upstream.version)"
+RELEASE="$("$HERE/recipe_query" "$RECIPE" upstream.release)"
+SYSTEM="$("$HERE/recipe_query" "$RECIPE" build.system)"
+
+# --- hard checks: no silent fallbacks --------------------------------
+[ "$VERSION" = "$UP_VER" ] || {
+  echo "build: requested version '$VERSION' != recipe upstream.version '$UP_VER'" >&2; exit 1; }
+[ "$SYSTEM" = "repack" ] || {
+  echo "build: build.system '$SYSTEM' not implemented by this feedstock" >&2; exit 1; }
+"$HERE/recipe_query" "$RECIPE" platforms | grep -q "\"$PLATFORM\"" || {
+  echo "build: platform '$PLATFORM' not listed in recipe platforms" >&2; exit 1; }
+
+TOP="$(pwd)"
+WORK="work/$NAME/$PLATFORM"
+OUT="out/$NAME/$PLATFORM"
+ROOT="$OUT/root"
+mkdir -p "$WORK/src" "$OUT/tools"
+rm -rf "$WORK/x" "$ROOT"   # scratch dirs: start each leg clean
+mkdir -p "$WORK/x" "$ROOT"
+
+ASSET_FILE="$(asset_field "$RECIPE" "$PLATFORM" file)"
+ASSET_SHA="$(asset_field "$RECIPE" "$PLATFORM" sha256)"
+ARCHIVE="$(asset_field "$RECIPE" "$PLATFORM" archive)"
+MEMBER="$(asset_field "$RECIPE" "$PLATFORM" member)"
+EXE_SUFFIX="$(exe_suffix_for "$PLATFORM")"
+
+# --- fetch + verify upstream -----------------------------------------
+FETCHED="$WORK/src/$ASSET_FILE"
+if [ ! -f "$FETCHED" ]; then
+  fetch_verified "$RELEASE/$ASSET_FILE" "$ASSET_SHA" "$FETCHED"
+else
+  # cached assets are re-verified, never trusted
+  got="$(sha256_of "$FETCHED")"
+  [ "$got" = "$ASSET_SHA" ] || { echo "build: cached asset sha256 mismatch, refetch" >&2
+    fetch_verified "$RELEASE/$ASSET_FILE" "$ASSET_SHA" "$FETCHED"; }
+fi
+cross_check_sums "$RECIPE" "$PLATFORM" "$ASSET_FILE" "$ASSET_SHA" "$WORK/src"
+
+# --- stage the payload root -------------------------------------------
+# prefix=/ : the staging tree IS the payload root, so provides paths
+# (/bin/<tool>) land at the image root. Only declared members are staged —
+# upstream archive extras (docs, completions) never enter the tree.
+N_EXES=$("$HERE/recipe_query" "$RECIPE" provides.executables | ruby -rjson -e 'puts JSON.parse(STDIN.read).length')
+[ "$N_EXES" = "1" ] || {
+  echo "build: this feedstock stages exactly one executable per payload (got $N_EXES)" >&2; exit 1; }
+EXE_PATH="$("$HERE/recipe_query" "$RECIPE" provides.executables.0.path)"
+
+if [ -z "$ARCHIVE" ]; then
+  BIN_SRC="$FETCHED"
+else
+  [ -n "$MEMBER" ] || { echo "build: archive asset without member: upstream.assets.$PLATFORM" >&2; exit 1; }
+  case "$ARCHIVE" in
+    tar.gz) tar -xzf "$FETCHED" -C "$WORK/x" ;;
+    zip)    unzip -o -q "$FETCHED" -d "$WORK/x" ;;
+    *) echo "build: unknown archive format '$ARCHIVE'" >&2; exit 1 ;;
+  esac
+  [ -f "$WORK/x/$MEMBER" ] || { echo "build: declared member missing in archive: $MEMBER" >&2; exit 1; }
+  BIN_SRC="$WORK/x/$MEMBER"
+fi
+mkdir -p "$ROOT$(dirname "$EXE_PATH")"
+install -m 0755 "$BIN_SRC" "$ROOT$EXE_PATH$EXE_SUFFIX"
+
+# --- the license notice(s) ride the payload ---------------------------
+# (a) a pinned license_file fetched from the release's source tag;
+# (b) license members carried inside the asset archive itself.
+LIC_DIR="$ROOT/share/licenses/$NAME"
+if LIC_URL="$("$HERE/recipe_query" -o "$RECIPE" upstream.license_file.url)" && [ "$LIC_URL" != "[]" ]; then
+  LIC_SHA="$("$HERE/recipe_query" "$RECIPE" upstream.license_file.sha256)"
+  mkdir -p "$LIC_DIR"
+  fetch_verified "$LIC_URL" "$LIC_SHA" "$LIC_DIR/$(basename "$LIC_URL")"
+fi
+while IFS= read -r m; do
+  [ -n "$m" ] || continue
+  [ -f "$WORK/x/$m" ] || { echo "build: declared license member missing in archive: $m" >&2; exit 1; }
+  mkdir -p "$LIC_DIR"
+  install -m 0644 "$WORK/x/$m" "$LIC_DIR/$(basename "$m")"
+done < <(asset_licenses "$RECIPE" "$PLATFORM")
+
+# every declared executable must exist in the staging tree (the windows
+# leg stages the .exe form of the canonical declared path)
+[ -x "$ROOT$EXE_PATH$EXE_SUFFIX" ] || {
+  echo "build: declared executable missing in staging tree: $EXE_PATH$EXE_SUFFIX" >&2; exit 1; }
+
+# --- imaging tool (sha256-verified) ----------------------------------
+# Every leg images and reads with the Rust tfs CLI from the tebako
+# release pinned in the recipe (the product's in-process writer —
+# limnifs, the default format). The recipe pin is cross-checked against
+# the release's own SHA256SUMS inside download_tfs.
+TFS_REPO="$("$HERE/recipe_query" "$RECIPE" tools.repo)"
+TFS_REL="$("$HERE/recipe_query" "$RECIPE" tools.release)"
+TFS_SHA="$("$HERE/recipe_query" "$RECIPE" "tools.sha256.$(asset_infix "$PLATFORM")")"
+download_tfs "$OUT/tools" "$TFS_REPO" "$TFS_REL" "$PLATFORM" "$TFS_SHA"
+
+# --- pack the payload image -------------------------------------------
+pack_image "$PLATFORM" "$OUT/tools" "$ROOT" "$OUT/payload.tfs"
+
+echo "build: OK  $NAME $VERSION ($PLATFORM)"
+echo "  image:  $OUT/payload.tfs"
+echo "  sha256: $(sha256_of "$OUT/payload.tfs")"

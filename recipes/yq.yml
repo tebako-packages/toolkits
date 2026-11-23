@@ -1,0 +1,72 @@
+# Feedstock recipe for yq — a REPACK feedstock: upstream's official static
+# builds (Go, CGO-free) are fetched (sha256-pinned, cross-checked against
+# upstream's own published sums), staged, and pressed as a .tfs payload.
+# Nothing compiles on any leg.
+name: "yq"
+kind: toolkit
+summary: "yq — the command-line YAML/XML/TOML processor (upstream static build)"
+
+upstream:
+  version: "4.54.3"
+  homepage: "https://mikefarah.gitbook.io/yq/"
+  license: "MIT"
+  release: "https://github.com/mikefarah/yq/releases/download/v4.54.3"
+  # Upstream-published checksum document (rhash multi-hash format: each
+  # line is "<file>  <hash>…" with columns per checksums_hashes_order; the
+  # SHA-256 column is located from that order file, never hardcoded). The
+  # per-triplet pin below is the trust anchor; build cross-checks it
+  # against this file at fetch time.
+  sums: {file: "checksums", format: "rhash", order_file: "checksums_hashes_order"}
+  # MIT requires the notice to accompany copies: the license file at the
+  # release's source tag, pinned like every other fetched byte.
+  license_file:
+    url: "https://raw.githubusercontent.com/mikefarah/yq/v4.54.3/LICENSE"
+    sha256: "697db34dabb21562fe84487a2ccd031fbd45382b89c2cbdec8ef31682c486040"
+  # Per-tebako-triplet upstream asset (a bare static binary) + its sha256.
+  assets:
+    aarch64-macos:       {file: "yq_darwin_arm64",      sha256: "a2aebb93b5bdcb61bb76f630e42a0ef6a3ee10842a6516cd7b9e4080786ec593"}
+    x86_64-macos:        {file: "yq_darwin_amd64",      sha256: "96d5105ffd693d6845c54fbd825b2d1bbdb8619e0a2ce6af95e5654e841e0984"}
+    x86_64-linux-gnu:    {file: "yq_linux_amd64",       sha256: "129534601871538efe0ba4c5e62a34fb1d5f469bcb975c4fddeb467d82974973"}
+    aarch64-linux-gnu:   {file: "yq_linux_arm64",       sha256: "89f69310b61b68d1245065a1241d1fc843f7a36cd6103ffd77ad987613bd1b67"}
+    x86_64-windows-ucrt: {file: "yq_windows_amd64.exe", sha256: "066ea0a09a282e47588ec1e1867280ff5ede458f7183617a2d99012e4e34f18a"}
+
+build:
+  system: repack        # fetch upstream's verified static build → stage → image
+
+# Image tooling (every leg): the tfs CLI from the tamatebako/tebako
+# release — `tfs mkimage` (limnifs, the default tebako image format) is
+# the imager and the boot smoke's info/tree/extract reader. The asset
+# digests are pinned here (the repo's toolchain pin SSOT — the same
+# trust-anchor role as the upstream asset pins) and cross-checked against
+# the release's own SHA256SUMS at fetch time (lib/common.sh's download_tfs).
+tools:
+  repo: "tamatebako/tebako"
+  release: "v2.8.83"
+  sha256:
+    linux-gnu-x86_64: "126777314d562d74b8ff7aacc33256dc2fa0e248e7b6d914eac29679ddd728b2"
+    linux-gnu-arm64: "41472b8b936eb6c482bec4b595e8b80c21c6499492cf8d4128c980f362a4450c"
+    macos-arm64: "a8c5481736801f72cd9c3da648ec208601187ac4335e19086bb5ea28c203feed"
+    macos-x86_64: "5003bd83fe93a5e707bbb519ee78ec01008f44a2e0d5ba32cbc59a349f03e8e8"
+    windows-ucrt64: "a965052e5ccc6e9589b17b4004d3b645650fb08cd16e34bf9b0651d882d24fdf"
+
+platforms:
+  - x86_64-linux-gnu
+  - aarch64-linux-gnu
+  - aarch64-macos
+  - x86_64-macos
+  - x86_64-windows-ucrt
+
+provides:
+  executables:
+    # the windows image carries /bin/yq.exe (stage fills the suffix)
+    - {name: "yq", path: "/bin/yq", version: "4.54.3"}
+  libraries: []
+
+# The boot smoke's run contract (tools/boot_smoke): the packaged binary
+# runs from the extracted image and answers before any leg goes green.
+smoke:
+  version: {argv: ["--version"], expect: "v4.54.3"}
+  functional: {argv: ["-n", ".ok = true"], expect: "ok: true"}
+
+exec_tier: static         # upstream's static Go build (CGO disabled); macOS links OS libraries only (verified — see README's provenance table)
+exec_closure: []          # static tier
