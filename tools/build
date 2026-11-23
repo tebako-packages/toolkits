@@ -99,6 +99,7 @@ if LIC_URL="$("$HERE/recipe_query" -o "$RECIPE" upstream.license_file.url)" && [
   fetch_verified "$LIC_URL" "$LIC_SHA" "$LIC_DIR/$(basename "$LIC_URL")"
 fi
 while IFS= read -r m; do
+  m="${m%$'\r'}"   # belt-and-braces with asset_licenses' binmode
   [ -n "$m" ] || continue
   [ -f "$WORK/x/$m" ] || { echo "build: declared license member missing in archive: $m" >&2; exit 1; }
   mkdir -p "$LIC_DIR"
