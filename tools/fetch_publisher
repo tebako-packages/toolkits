@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# tools/fetch_publisher — fetch the publish/dogfood toolchain (the tebako
+# CLI + the tebako-shim dispatcher) from the pinned tamatebako/tebako
+# release, sha256-verified.
+#
+#   tools/fetch_publisher DESTDIR [INFIX]
+#
+# DESTDIR receives tebako[.exe] and tebako-shim[.exe]. INFIX is the
+# release-asset platform infix (macos-arm64, linux-gnu-x86_64, …); the
+# default is the host's. Both binaries land together: install links shims
+# at the dispatcher found beside the CLI, and `tebako publish`'s
+# clean-cache verify rides the same sibling lookup.
+#
+# The pins live in the recipes' tools.tebako.sha256 / tools.shim.sha256
+# blocks (the repo's toolchain pin SSOT). Every recipe must agree on
+# repo/release/pins — the publish consumes ONE toolchain for all tools,
+# so a drifted recipe is a named error here, never a mixed fetch. The
+# pins are cross-checked against the release's own SHA256SUMS (both
+# anchored — the same doctrine as lib/common.sh's download_tfs).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/lib/common.sh"
+
+DEST="${1:?usage: tools/fetch_publisher DESTDIR [INFIX]}"
+INFIX="${2:-}"
+
+host_infix() {
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64)    printf '%s' macos-arm64 ;;
+    Darwin-x86_64)   printf '%s' macos-x86_64 ;;
+    Linux-x86_64)    printf '%s' linux-gnu-x86_64 ;;
+    Linux-aarch64)   printf '%s' linux-gnu-arm64 ;;
+    MINGW*|MSYS*)    printf '%s' windows-ucrt64 ;;
+    *) echo "fetch_publisher: unknown host '$(uname -s)-$(uname -m)' — pass INFIX explicitly" >&2; return 1 ;;
+  esac
+}
+[ -n "$INFIX" ] || INFIX="$(host_infix)"
+
+# All recipes must agree on the toolchain (repo, release, this infix's
+# tebako + shim pins). recipe_query's own refusal names a missing key.
+REPO="" RELEASE="" TEBAKO_SHA="" SHIM_SHA=""
+for recipe in "$HERE"/../recipes/*.yml; do
+  r="$("$HERE/recipe_query" "$recipe" tools.repo)"
+  v="$("$HERE/recipe_query" "$recipe" tools.release)"
+  t="$("$HERE/recipe_query" "$recipe" "tools.tebako.sha256.$INFIX")"
+  s="$("$HERE/recipe_query" "$recipe" "tools.shim.sha256.$INFIX")"
+  if [ -z "$REPO" ]; then
+    REPO="$r" RELEASE="$v" TEBAKO_SHA="$t" SHIM_SHA="$s"
+  elif [ "$r" != "$REPO" ] || [ "$v" != "$RELEASE" ] || [ "$t" != "$TEBAKO_SHA" ] || [ "$s" != "$SHIM_SHA" ]; then
+    echo "fetch_publisher: toolchain pin drift in $recipe — every recipe must pin the same tebako/tebako-shim for $INFIX" >&2
+    exit 1
+  fi
+done
+
+exe=""; case "$INFIX" in windows-ucrt*) exe=".exe" ;; esac
+tebako_asset="tebako-${RELEASE#v}-${INFIX}${exe}"
+shim_asset="tebako-shim-${RELEASE#v}-${INFIX}${exe}"
+base="https://github.com/${REPO}/releases/download/${RELEASE}"
+mkdir -p "$DEST"
+sums="$DEST/SHA256SUMS.${RELEASE}"
+[ -f "$sums" ] || fetch "${base}/SHA256SUMS" "$sums"
+# Cross-check: the recipe pins must match the release's own sums (a drifted
+# pin fails loudly, never a silent fetch of the wrong bytes).
+for pair in "$tebako_asset:$TEBAKO_SHA" "$shim_asset:$SHIM_SHA"; do
+  asset="${pair%%:*}"; want="${pair##*:}"
+  got="$(awk -v a="$asset" '$2 == a {print $1}' "$sums")"
+  [ "$got" = "$want" ] || { echo "fetch_publisher: pin mismatch for $asset: recipe=$want release=${got:-ABSENT}" >&2; exit 1; }
+done
+fetch_verified "${base}/${tebako_asset}" "$TEBAKO_SHA" "$DEST/tebako${exe}"
+fetch_verified "${base}/${shim_asset}" "$SHIM_SHA" "$DEST/tebako-shim${exe}"
+chmod 755 "$DEST/tebako${exe}" "$DEST/tebako-shim${exe}"
+echo "fetch_publisher: tebako + tebako-shim $RELEASE ($INFIX) staged in $DEST"

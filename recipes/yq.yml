@@ -42,12 +42,37 @@ build:
 tools:
   repo: "tamatebako/tebako"
   release: "v2.8.83"
-  sha256:
-    linux-gnu-x86_64: "126777314d562d74b8ff7aacc33256dc2fa0e248e7b6d914eac29679ddd728b2"
-    linux-gnu-arm64: "41472b8b936eb6c482bec4b595e8b80c21c6499492cf8d4128c980f362a4450c"
-    macos-arm64: "a8c5481736801f72cd9c3da648ec208601187ac4335e19086bb5ea28c203feed"
-    macos-x86_64: "5003bd83fe93a5e707bbb519ee78ec01008f44a2e0d5ba32cbc59a349f03e8e8"
-    windows-ucrt64: "a965052e5ccc6e9589b17b4004d3b645650fb08cd16e34bf9b0651d882d24fdf"
+  # Per-tool asset digests, same trust-anchor role as the upstream asset
+  # pins: tfs images every leg (lib/common.sh's download_tfs); tebako +
+  # tebako-shim are the publish/dogfood toolchain (tools/fetch_publisher —
+  # install and the publish verify need the dispatcher beside the CLI).
+  tfs:
+    sha256:
+      linux-gnu-x86_64: "126777314d562d74b8ff7aacc33256dc2fa0e248e7b6d914eac29679ddd728b2"
+      linux-gnu-arm64: "41472b8b936eb6c482bec4b595e8b80c21c6499492cf8d4128c980f362a4450c"
+      macos-arm64: "a8c5481736801f72cd9c3da648ec208601187ac4335e19086bb5ea28c203feed"
+      macos-x86_64: "5003bd83fe93a5e707bbb519ee78ec01008f44a2e0d5ba32cbc59a349f03e8e8"
+      windows-ucrt64: "a965052e5ccc6e9589b17b4004d3b645650fb08cd16e34bf9b0651d882d24fdf"
+  tebako:
+    sha256:
+      linux-gnu-x86_64: "6c046d0207895566acf02d2cf3990e4f0a3a82f2ea3961473b476c99a72fa932"
+      linux-gnu-arm64: "9cd4537470a0b81882f932c0a9c7916c3fb4c9ca8d4151e466e7fdce8219fff9"
+      macos-arm64: "c49c57d0cebbe9a547b4e1f30782b68123560d011190e9207c4db0c57b215fb9"
+      macos-x86_64: "2719242b77a1a1add718b92265eaeada2e6ca2d157f2c3c2725c8047e70105a6"
+      windows-ucrt64: "5b2ba381a59c0efbb97c69c864a26cae6736e7fd902f10f7ec49153ec039055b"
+  shim:
+    sha256:
+      linux-gnu-x86_64: "d7666ada6951f434d912e035bd91a2dcde583cc7a66b2a53159161c2c8310186"
+      linux-gnu-arm64: "4cc71c6bb87c914c86f14398fa375e34a59c95bc021a89e736ed1eeb3a5e7ec2"
+      macos-arm64: "5218004513366aefe6ee85c6630f93f6e52bfb763d8af7b5dba45d402a9b86d3"
+      macos-x86_64: "8845bd7b2add5102f23d160e0e57165cea174bb9527871d0cfd0d0af8ff6103e"
+      windows-ucrt64: "ac902e2679f908bf82d5205abca216416ee59815cea3c891658a50eba1d8c393"
+
+# Signing (spec 09 §9): every published artifact is signed by the
+# tamatebako root CI subkey; the keyid is the root primary's low-64. The
+# publish is fail-closed when the signing secret is absent — a signing
+# feedstock never publishes unsigned.
+signing: {keyid: "efc3c250f7862a48"}
 
 platforms:
   - x86_64-linux-gnu

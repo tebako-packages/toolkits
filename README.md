@@ -116,17 +116,30 @@ Every shipped binary was inspected, not assumed:
 
 - `recipes/<tool>.yml` — one recipe per tool: upstream release + per-triplet
   asset pins, the checksum cross-check shape, the license notice source,
-  the tfs toolchain pin (`tamatebako/tebako` v2.8.83, per-infix sha256),
-  the declared entrypoints, and the boot-smoke contract.
+  the toolchain pins (`tamatebako/tebako` v2.8.83: `tfs` for the legs,
+  `tebako` + `tebako-shim` for publish/dogfood — per-infix sha256), the
+  `signing:` block (spec 09 §9), the declared entrypoints, and the
+  boot-smoke contract.
 - `tools/` — the build machine: `emit_matrix` (one CI leg per
   recipe × platform), `build` (fetch → verify → stage → `tfs mkimage`),
   `boot_smoke` (extract-and-run the recipe's `smoke:` contract),
   `stage` (embed the manifest, repack, read-back-validate, sidecar),
-  `recipe_query`, `lib/common.sh`.
+  `fetch_publisher` (the pinned tebako CLI + shim, sha256-verified),
+  `publish` (per-recipe `tebako publish` → release + registry upsert;
+  `--dry-run` rehearses into a file:// mirror),
+  `set_registry_defaults.rb`, `recipe_query`, `lib/common.sh`.
 - `manifests/payload.yaml` — the spec-03 manifest template `stage` fills.
+- `tpkg-registry.yaml` — the feedstock's resolved registry (spec 04 §2).
+  Upserted ONLY by the publish job; empty until the first tag.
 - `.github/workflows/build-payload.yml` — matrix build → boot-smoke →
-  staged artifacts (per-leg `dist/` upload). **No publish leg** (see
-  below).
+  staged artifacts → the publish legs: `publish-dry-run` (every non-publish
+  run rehearses the full publish into a file:// mirror, install verify
+  included) and `release` (the owner's tag dispatch, publish=true), then
+  `ping-registry` (the aggregate poke).
+- `.github/workflows/dogfood.yml` — the dogfood: per desktop triplet,
+  `tebako install <tool>` from the PUBLISHED registry on a scratch
+  `TEBAKO_HOME`, each tool's shim answers. Gated on the published rows
+  (skips loudly pre-publish).
 
 Local build (one leg):
 
@@ -134,21 +147,52 @@ Local build (one leg):
 $ tools/build recipes/jq.yml 1.8.2 aarch64-macos
 $ tools/boot_smoke out/jq/aarch64-macos recipes/jq.yml
 $ tools/stage out/jq/aarch64-macos aarch64-macos recipes/jq.yml
-# dist/jq-1.8.2-aarch64-macos.tfs (+ .manifest.yaml sidecar)
+# dist/jq-1.8.2-macos-arm64.tfs (+ .manifest.yaml sidecar)
 ```
+
+## Publishing (the owner's act)
+
+Nothing publishes on push, on a PR, or on a tag push. Publishing is the
+owner's explicit act, per the ecosystem hard rule:
+
+1. Push the tag. Grammar: `<feedstock-version>[-<buildno>]` (e.g.
+   `0.1.0-1`) — the feedstock's own release line, independent of the
+   per-tool recipe versions. A version carrying a non-numeric segment
+   after the numeric prefix (`0.2.0rc1-1`) is a PRERELEASE shape: its
+   rows publish like any other, but the release is flagged
+   `--prerelease` and the registry `default:` entries stay on the latest
+   stable publish.
+2. Dispatch `.github/workflows/build-payload.yml` ON THE TAG with
+   `publish=true`.
+3. The `release` job then: republishes every recipe's staged artifacts
+   to the tag's release (15 `.tfs` + 15 `.sha256` + 15 `.blksum.json` +
+   15 `.asc` — spec-09 §9 signatures by the tamatebako root CI subkey,
+   keyid `efc3c250f7862a48`), verifies each published row with a
+   clean-cache install before the registry moves, upserts
+   `tpkg-registry.yaml`, and lands it on main by bot PR + auto-merge
+   (main is branch-protected).
+4. `ping-registry` pokes the aggregate registry
+   (tebako-packages/registry) so the publish is visible there the same
+   day; its 6-hourly aggregate is the self-healing backstop.
+
+Every other run of the workflow exercises the same pipeline as
+`publish-dry-run`: a full publish into a file:// mirror — the CLI's pin
+verification and clean-cache install verify through the mirror included
+— with nothing leaving the runner.
 
 ## Limits (this increment, honestly)
 
-- **Nothing is published, signed, or registered yet.** The payloads
-  build and install, but install warns they are unsigned; there is no
-  release, no `tpkg-registry.yaml`, no aggregate-registry row. That is
-  the next increment (below) — this one lands the recipes, the build
-  machine, and the CI legs.
+- **Nothing is published yet — by rule, not by absence.** The publish
+  pipeline (build → mirror-rehearsed dry-run → tag-gated real publish →
+  registry bot PR → aggregate ping) is landed and CI-proven, but the
+  first tag is the owner's explicit go. Until then `tpkg-registry.yaml`
+  carries no rows and the dogfood's gate skips its legs loudly.
 - **Upstream's builds, not ours.** We repack what upstream ships. If an
   upstream build is buggy or compromised, the pin protects the *bytes'*
-  identity, not their goodness; the trust story is the signing increment
-  plus upstream's own release provenance (ripgrep attests its archives;
-  jq/yq publish checksums we cross-check).
+  identity, not their goodness; the trust story is the spec-09 §9
+  signature the publish stamps plus upstream's own release provenance
+  (ripgrep attests its archives; jq/yq publish checksums we
+  cross-check).
 - **Coverage is exactly the five triplets listed.** Named gaps we do
   NOT cover yet: aarch64-windows (upstream ships `jq-windows-arm64.exe`
   and `ripgrep-…-aarch64-pc-windows-msvc.zip`; tebako's windows lane is
@@ -163,17 +207,8 @@ $ tools/stage out/jq/aarch64-macos aarch64-macos recipes/jq.yml
 
 ## Next increments (named, in order)
 
-1. **Publish + sign + register** — the tag-gated publish leg (per-triplet
-   `.tfs` + manifests + `SHA256SUMS` + resolved `tpkg-registry.yaml`),
-   spec-09 §9 signing with the tamatebako root CI subkey, and the
-   aggregate-registry ping. Then the root `tpkg-registry.yaml` lands on
-   main.
-2. **The dogfood** — `tebako install <tool>` per desktop triplet from
-   the PUBLISHED registry on a scratch `TEBAKO_HOME`, shimmed invocation
-   answers, cited output (the issue's acceptance), as a permanent
-   workflow like hello's dogfood-windows.
-3. **More tools** — fd-class, git (if license/static-clean), per the
+1. **More tools** — fd-class, git (if license/static-clean), per the
    census's candidate set.
-4. **Source-built statics for the gaps** — only where upstream ships no
+2. **Source-built statics for the gaps** — only where upstream ships no
    acceptable build for a wanted triplet (aarch64-windows first, if the
    windows lane widens).

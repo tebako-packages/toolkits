@@ -171,7 +171,7 @@ cross_check_sums() {
 
 # download_tfs DESTDIR REPO RELEASE TRIPLET EXPECTED_SHA256
 # Downloads tfs-<version>-<infix>[.exe] from the tamatebako/tebako
-# release as tfs[.exe]. The recipe pin (tools.sha256.<infix>) is the
+# release as tfs[.exe]. The recipe pin (tools.tfs.sha256.<infix>) is the
 # trust anchor AND is cross-checked against the release's own SHA256SUMS
 # (both anchored — the same rule the workflow pin checks follow).
 download_tfs() {

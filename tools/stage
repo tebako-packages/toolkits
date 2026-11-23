@@ -5,10 +5,12 @@
 #   tools/stage OUT_DIR PLATFORM [RECIPE]
 #
 # Produces in dist/:
-#   <name>-<version>-<platform>.tfs             the payload image (with
-#                                               /__tpkg__/manifest.yaml inside)
-#   <name>-<version>-<platform>.manifest.yaml   the sidecar manifest (spec 03),
-#                                               carrying the artifact's digest
+#   <name>-<version>-<asset>.tfs             the payload image (with
+#                                            /__tpkg__/manifest.yaml inside)
+#   <name>-<version>-<asset>.manifest.yaml   the sidecar manifest (spec 03),
+#                                            carrying the artifact's digest
+# where <asset> is the platform's release-asset name (macos-arm64, …) —
+# the `tebako publish` CLI's naming grammar.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -60,8 +62,12 @@ check_filled() {  # any placeholder left behind means template drift — fail lo
 }
 
 mkdir -p dist "$ROOT/__tpkg__"
-ART="dist/${NAME}-${VERSION}-${PLATFORM}.tfs"
-MAN="dist/${NAME}-${VERSION}-${PLATFORM}.manifest.yaml"
+# Publish-ready names (the `tebako publish` CLI's grammar): the artifact
+# name carries the release-asset platform suffix (macos-arm64, …), the
+# registry rows key platforms by triplet.
+INFIX="$(asset_infix "$PLATFORM")"
+ART="dist/${NAME}-${VERSION}-${INFIX}.tfs"
+MAN="dist/${NAME}-${VERSION}-${INFIX}.manifest.yaml"
 ZEROS="$(printf '0%.0s' $(seq 64))"
 
 # The EMBEDDED manifest (tier 1, authoritative): the in-image digest can

@@ -118,7 +118,7 @@ done < <(asset_licenses "$RECIPE" "$PLATFORM")
 # the release's own SHA256SUMS inside download_tfs.
 TFS_REPO="$("$HERE/recipe_query" "$RECIPE" tools.repo)"
 TFS_REL="$("$HERE/recipe_query" "$RECIPE" tools.release)"
-TFS_SHA="$("$HERE/recipe_query" "$RECIPE" "tools.sha256.$(asset_infix "$PLATFORM")")"
+TFS_SHA="$("$HERE/recipe_query" "$RECIPE" "tools.tfs.sha256.$(asset_infix "$PLATFORM")")"
 download_tfs "$OUT/tools" "$TFS_REPO" "$TFS_REL" "$PLATFORM" "$TFS_SHA"
 
 # --- pack the payload image -------------------------------------------
