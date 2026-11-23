@@ -66,25 +66,31 @@ BIN="$TMP$EXE_PATH$EXE_SUFFIX"
 [ -x "$BIN" ] || { echo "boot_smoke: FAIL — $EXE_PATH$EXE_SUFFIX not executable in image" >&2; exit 1; }
 
 # the recipe's smoke: contract — argv vectors are YAML lists (one
-# element per line here; CLI flags never carry newlines)
+# element per line here; CLI flags never carry newlines). binmode: ucrt64
+# ruby text mode would emit \r\n (the read loop strips the \r too —
+# belt-and-braces, same defense as tools/stage's read-back).
 smoke_argv() {  # $1 = smoke.<key>.argv
-  "$HERE/recipe_query" "$RECIPE" "$1" | ruby -rjson -e 'JSON.parse(STDIN.read).each { |a| puts a }'
+  "$HERE/recipe_query" "$RECIPE" "$1" | ruby -rjson -e '$stdout.binmode; JSON.parse(STDIN.read).each { |a| puts a }'
 }
 V_EXPECT="$("$HERE/recipe_query" "$RECIPE" smoke.version.expect)"
 V_ARGV=()
-while IFS= read -r a; do V_ARGV+=("$a"); done < <(smoke_argv smoke.version.argv)
+while IFS= read -r a; do a="${a%$'\r'}"; V_ARGV+=("$a"); done < <(smoke_argv smoke.version.argv)
 F_EXPECT="$("$HERE/recipe_query" "$RECIPE" smoke.functional.expect)"
 F_ARGV=()
-while IFS= read -r a; do F_ARGV+=("$a"); done < <(smoke_argv smoke.functional.argv)
+while IFS= read -r a; do a="${a%$'\r'}"; F_ARGV+=("$a"); done < <(smoke_argv smoke.functional.argv)
 F_STDIN="$("$HERE/recipe_query" -o "$RECIPE" smoke.functional.stdin)"
 [ "$F_STDIN" = "[]" ] && F_STDIN=""
 
 echo "--- run: $EXE_PATH$EXE_SUFFIX ${V_ARGV[*]} (from extracted image) ---"
-# Capture the FULL output first: piping the child through `head -1`
-# breaks on windows (no SIGPIPE — head exits, the child's next write
-# fails, and pipefail then kills the step before any assertion runs).
+# Capture the FULL output plus the exit code BEFORE any assertion: a
+# failing run must print what the tool said (set -e would otherwise kill
+# the step silently inside the command substitution).
+set +e
 RAW="$("$BIN" "${V_ARGV[@]}" 2>&1)"
-echo "$RAW"
+rc=$?
+set -e
+printf '%s\n' "$RAW"
+[ "$rc" -eq 0 ] || { echo "boot_smoke: FAIL — $EXE_PATH$EXE_SUFFIX ${V_ARGV[*]} exited $rc" >&2; exit 1; }
 VER_OUT="$(printf '%s\n' "$RAW" | head -1)"
 case "$VER_OUT" in
   *"$V_EXPECT"*) : ;;
@@ -92,8 +98,12 @@ case "$VER_OUT" in
 esac
 
 echo "--- run: $EXE_PATH$EXE_SUFFIX ${F_ARGV[*]} (functional) ---"
+set +e
 RUN_OUT="$(printf '%s' "$F_STDIN" | "$BIN" "${F_ARGV[@]}" 2>&1)"
-echo "$RUN_OUT"
+rc=$?
+set -e
+printf '%s\n' "$RUN_OUT"
+[ "$rc" -eq 0 ] || { echo "boot_smoke: FAIL — $EXE_PATH$EXE_SUFFIX ${F_ARGV[*]} exited $rc" >&2; exit 1; }
 case "$RUN_OUT" in
   *"$F_EXPECT"*) : ;;
   *) echo "boot_smoke: FAIL — functional output does not contain '$F_EXPECT'" >&2; exit 1 ;;
