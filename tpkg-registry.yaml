@@ -1,0 +1,7 @@
+schema_version: 1
+# The toolkits package registry (spec 04 §2) — upserted ONLY by the
+# build-payload publish job (the owner's tag dispatch with publish=true,
+# signed per the recipes' signing: blocks). Never hand-edited: main is
+# branch-protected, the rows land by bot PR + auto-merge. Empty until the
+# first publish.
+payloads: []

@@ -1,0 +1,212 @@
+name: dogfood
+# THE dogfood: a bare runner installs the tebako CLI from the published
+# tamatebako/tebako release, adds THIS feedstock's published registry,
+# installs the published tool payloads, and runs each tool through its
+# shim — proving the full dispatch chain (registry -> payload fetch +
+# verify -> shim exec) on a scratch TEBAKO_HOME per desktop triplet.
+#
+# The gate probes the PUBLISHED registry rows (the shared composite
+# action in tebako-packages/index): pre-publish, a row simply does not
+# exist yet, so the legs SKIP loudly — never a red leg for an artifact
+# nobody could have published yet (the metanorma gate doctrine). The
+# first tag's publish lands the rows; from then on the legs run.
+#
+# No pull_request trigger yet on purpose: the gate fetches
+# main/tpkg-registry.yaml, and main carries that file only once the
+# publish increment merges — a PR touching this workflow before that
+# would red the gate on the fetch, not on anything it could fix. Add
+#   pull_request:
+#     paths: [".github/workflows/dogfood.yml"]
+# with the first published tag (the metanorma shape).
+on:
+  schedule:
+    - cron: "43 5 * * *"        # nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: published rows present?
+    runs-on: ubuntu-24.04
+    outputs:
+      published: ${{ steps.gate.outputs.published }}
+      release: ${{ steps.pins.outputs.release }}
+      jq_version: ${{ steps.pins.outputs.jq_version }}
+      yq_version: ${{ steps.pins.outputs.yq_version }}
+      rg_version: ${{ steps.pins.outputs.rg_version }}
+      pin_tebako_macos_arm64: ${{ steps.pins.outputs.pin_tebako_macos_arm64 }}
+      pin_shim_macos_arm64: ${{ steps.pins.outputs.pin_shim_macos_arm64 }}
+      pin_tebako_macos_x86_64: ${{ steps.pins.outputs.pin_tebako_macos_x86_64 }}
+      pin_shim_macos_x86_64: ${{ steps.pins.outputs.pin_shim_macos_x86_64 }}
+      pin_tebako_linux_gnu_x86_64: ${{ steps.pins.outputs.pin_tebako_linux_gnu_x86_64 }}
+      pin_shim_linux_gnu_x86_64: ${{ steps.pins.outputs.pin_shim_linux_gnu_x86_64 }}
+      pin_tebako_linux_gnu_arm64: ${{ steps.pins.outputs.pin_tebako_linux_gnu_arm64 }}
+      pin_shim_linux_gnu_arm64: ${{ steps.pins.outputs.pin_shim_linux_gnu_arm64 }}
+      pin_tebako_windows_ucrt64: ${{ steps.pins.outputs.pin_tebako_windows_ucrt64 }}
+      pin_shim_windows_ucrt64: ${{ steps.pins.outputs.pin_shim_windows_ucrt64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: pins
+        # The recipes are the SSOT for versions and toolchain pins. Every
+        # recipe must agree on the toolchain (the build legs fetch per
+        # recipe; the dogfood legs fetch ONE toolchain for all tools —
+        # a drifted recipe is a named error here, never a mixed fetch).
+        run: |
+          set -euo pipefail
+          ruby -ryaml -e '
+            recipes = Dir.glob("recipes/*.yml").sort.map { |f| YAML.load_file(f) }
+            tools = recipes.map { |r| r.fetch("tools") }.uniq
+            abort "NAMED FAILURE: toolchain pin drift across recipes" unless tools.length == 1
+            tools = tools[0]
+            out = File.open(ENV.fetch("GITHUB_OUTPUT"), "a")
+            out.puts "release=#{tools.fetch("release")}"
+            %w[jq yq ripgrep].each do |name|
+              r = recipes.find { |d| d.fetch("name") == name } or abort "NAMED FAILURE: no #{name} recipe"
+              v = r.fetch("upstream").fetch("version")
+              out.puts "#{name == "ripgrep" ? "rg" : name}_version=#{v}"
+            end
+            tools.fetch("tebako").fetch("sha256").each do |infix, sha|
+              key = infix.tr("-", "_")
+              shim = tools.fetch("shim").fetch("sha256").fetch(infix)
+              out.puts "pin_tebako_#{key}=#{sha}"
+              out.puts "pin_shim_#{key}=#{shim}"
+            end
+          '
+      # The gate is the shared composite action (tebako-packages/index) —
+      # never re-inline a per-repo probe here. One probe per tool row; a
+      # missing row skips the legs loudly (pre-publish), a fetch failure
+      # reds the gate (a transient error is never absence).
+      - id: probe-jq
+        uses: tebako-packages/index/.github/actions/probe-registry-row@main
+        with:
+          registry-url: https://raw.githubusercontent.com/tebako-packages/toolkits/main/tpkg-registry.yaml
+          payload: jq
+          version: ${{ steps.pins.outputs.jq_version }}
+      - id: probe-yq
+        uses: tebako-packages/index/.github/actions/probe-registry-row@main
+        with:
+          registry-url: https://raw.githubusercontent.com/tebako-packages/toolkits/main/tpkg-registry.yaml
+          payload: yq
+          version: ${{ steps.pins.outputs.yq_version }}
+      - id: probe-rg
+        uses: tebako-packages/index/.github/actions/probe-registry-row@main
+        with:
+          registry-url: https://raw.githubusercontent.com/tebako-packages/toolkits/main/tpkg-registry.yaml
+          payload: ripgrep
+          version: ${{ steps.pins.outputs.rg_version }}
+      - id: gate
+        run: |
+          set -euo pipefail
+          p="${{ steps.probe-jq.outputs.published }}/${{ steps.probe-yq.outputs.published }}/${{ steps.probe-rg.outputs.published }}"
+          if [ "$p" = "true/true/true" ]; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::not all tool rows are published yet (jq/yq/ripgrep: $p) — the legs skip loudly; the first tag publishes them"
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  dogfood:
+    name: ${{ matrix.triplet }}
+    needs: gate
+    if: needs.gate.outputs.published == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { triplet: aarch64-macos, os: macos-15, infix: macos-arm64 }
+          - { triplet: x86_64-macos, os: macos-15-intel, infix: macos-x86_64 }
+          - { triplet: x86_64-linux-gnu, os: ubuntu-22.04, infix: linux-gnu-x86_64 }
+          - { triplet: aarch64-linux-gnu, os: ubuntu-22.04-arm, infix: linux-gnu-arm64 }
+          - { triplet: x86_64-windows-ucrt, os: windows-latest, infix: windows-ucrt64 }
+    runs-on: ${{ matrix.os }}
+    env:
+      # A scratch home per leg: the install below is the full cold path —
+      # no runtimes, no payloads, no shims pre-seeded.
+      TEBAKO_HOME: ${{ runner.temp }}/tebako-home
+      TEBAKO_RELEASE: ${{ needs.gate.outputs.release }}
+      TEBAKO_SHA256: ${{ needs.gate.outputs[format('pin_tebako_{0}', replace(matrix.infix, '-', '_'))] }}
+      SHIM_SHA256: ${{ needs.gate.outputs[format('pin_shim_{0}', replace(matrix.infix, '-', '_'))] }}
+      JQ_VERSION: ${{ needs.gate.outputs.jq_version }}
+      YQ_VERSION: ${{ needs.gate.outputs.yq_version }}
+      RG_VERSION: ${{ needs.gate.outputs.rg_version }}
+    steps:
+      - name: Install the tebako CLI from the release (sha256-verified)
+        # The recipe pins are the trust anchor, cross-checked against the
+        # release's own SHA256SUMS (both anchored). The binaries land under
+        # their BARE names: the CLI locates the dispatcher beside its own
+        # current_exe (linux resolves through /proc/self/exe) — a
+        # version-named real file breaks that sibling lookup (exit 74).
+        run: |
+          set -euo pipefail
+          sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+          exe=""; case "${{ matrix.infix }}" in windows-ucrt*) exe=".exe" ;; esac
+          bin="$RUNNER_TEMP/tebako-bin"
+          mkdir -p "$bin" && cd "$bin"
+          base="https://github.com/tamatebako/tebako/releases/download/$TEBAKO_RELEASE"
+          curl -fsSLO --retry 5 --retry-all-errors --retry-delay 3 "$base/SHA256SUMS"
+          for pair in "tebako:$TEBAKO_SHA256" "tebako-shim:$SHIM_SHA256"; do
+            tool="${pair%%:*}"; want="${pair##*:}"
+            asset="$tool-${TEBAKO_RELEASE#v}-${{ matrix.infix }}${exe}"
+            curl -fsSLO --retry 5 --retry-all-errors --retry-delay 3 "$base/$asset"
+            got="$(sha "$asset")"
+            [ "$got" = "$want" ] || { echo "::error::pin mismatch for $asset: recipe=$want got=$got"; exit 1; }
+            rel="$(awk -v a="$asset" '$2 == a {print $1}' SHA256SUMS)"
+            [ "$rel" = "$want" ] || { echo "::error::cross-check mismatch for $asset: recipe=$want release=${rel:-ABSENT}"; exit 1; }
+            mv "$asset" "$tool$exe"
+            chmod 755 "$tool$exe"
+          done
+          echo "$bin" >> "$GITHUB_PATH"
+          tebako --version
+
+      - name: Add the published registry and install the tools
+        # The PUBLISHED registry only (no local rows): install fetches each
+        # artifact from the feedstock release, verifies it against the
+        # registry's sha256 pin AND the signature the publish stamped
+        # (spec 09 §9's zero-interaction rule — the tamatebako root public
+        # key is embedded in the CLI; no key import step rides here).
+        run: |
+          set -euo pipefail
+          tebako add-registry tfs:github:tebako-packages/toolkits
+          tebako install "jq@$JQ_VERSION"
+          tebako install "yq@$YQ_VERSION"
+          tebako install "ripgrep@$RG_VERSION"
+          echo "$TEBAKO_HOME/shims" >> "$GITHUB_PATH"
+          ls -la "$TEBAKO_HOME/shims"
+
+      - name: Assert the store holds one image + trust anchor per tool
+        run: |
+          set -euo pipefail
+          for payload in jq yq ripgrep; do
+            n="$(ls "$TEBAKO_HOME/payloads/$payload"/*.tfs 2>/dev/null | wc -l | tr -d ' ')"
+            [ "$n" = "1" ] || { echo "::error::$payload has $n images in store (expected 1)"; exit 1; }
+            ls "$TEBAKO_HOME/payloads/$payload"/*.tfs.sha256 >/dev/null
+          done
+          echo "store OK: 1 image + .sha256 trust anchor each for jq, yq, ripgrep"
+
+      - name: jq runs through its shim
+        # TEBAKO_JQ_VERSION pins the exec to the installed version (the
+        # registry default is a moving line — the version chain's env
+        # link, spec 07 §2.1, first hit wins).
+        run: |
+          set -euo pipefail
+          TEBAKO_JQ_VERSION="$JQ_VERSION" jq --version | grep -F "jq-$JQ_VERSION"
+          TEBAKO_JQ_VERSION="$JQ_VERSION" jq -n '{ok:true}' | grep -F '"ok": true'
+          echo "jq OK: $JQ_VERSION through the shim"
+
+      - name: yq runs through its shim
+        run: |
+          set -euo pipefail
+          TEBAKO_YQ_VERSION="$YQ_VERSION" yq --version | grep -F "version v$YQ_VERSION"
+          TEBAKO_YQ_VERSION="$YQ_VERSION" yq -n '.ok = true' | grep -F 'ok: true'
+          echo "yq OK: $YQ_VERSION through the shim"
+
+      - name: rg runs through its shim
+        # The ripgrep payload's executable is rg (the shim name); its env
+        # pin uppercases the argv0 (TEBAKO_RG_VERSION).
+        run: |
+          set -euo pipefail
+          TEBAKO_RG_VERSION="$RG_VERSION" rg --version | head -1 | grep -F "ripgrep $RG_VERSION"
+          printf 'needle\n' | TEBAKO_RG_VERSION="$RG_VERSION" rg needle | grep -F 'needle'
+          echo "rg OK: $RG_VERSION through the shim"

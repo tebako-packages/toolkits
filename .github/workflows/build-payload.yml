@@ -1,15 +1,30 @@
 name: build-payload
-# Feedstock build: recipes → matrix build → boot-smoke → staged artifacts.
-# Conventions: docs/conventions.md in tebako-packages/index.
+# Feedstock build: recipes → matrix build → boot-smoke → staged
+# artifacts, then the publish legs. Conventions: docs/conventions.md in
+# tebako-packages/index.
 #
-# This increment has NO publish leg: tag pushes, releases, registry rows,
-# and signing are the next increment (see README's roadmap). Nothing here
-# releases anything.
+# Publish: the owner's explicit act — dispatch this workflow ON THE TAG
+# with publish=true (the ecosystem hard rule: push/PR/tag runs build +
+# gate only, they never publish). The publish-dry-run job is the same
+# pipeline's PR-mode proof: it rehearses every recipe's publish into a
+# file:// mirror — the CLI's pin verification + clean-cache install
+# verify included — and nothing leaves the runner. Tag grammar:
+# <version>[-<buildno>] (e.g. 0.1.0-1); a version carrying a non-numeric
+# segment after the numeric prefix is a PRERELEASE shape (0.2.0rc1-1) —
+# its rows publish like any other but the release is flagged
+# --prerelease and the registry `default:` entries stay on the latest
+# stable publish (the publish job's policy step).
 on:
   push:
     branches: [main]
+    tags: ["*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish this run''s payloads to the tag release + registry PR (owner-only act; requires running on a tag ref)'
+        type: boolean
+        default: false
 
 # One run per branch/PR-head at a time: pushing to a branch with an open
 # PR would otherwise run every job twice (push + pull_request events);
@@ -18,8 +33,20 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+# contents: write — the publish job uploads the release assets.
+# pull-requests: write — the registry lands by bot PR + auto-merge (main
+# is branch-protected; the metanorma/pydata pattern).
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
+
+# Every run block is bash (set -euo pipefail). On windows-latest the
+# default shell is pwsh and every step would break — git-bash on the
+# windows runner provides curl/sha256sum. The msys2 legs keep their
+# explicit shell: msys2 {0} overrides.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   matrix:
@@ -92,3 +119,165 @@ jobs:
           name: dist-${{ matrix.name }}-${{ matrix.platform }}
           retention-days: 2
           path: dist/
+
+  publish-dry-run:
+    name: publish dry-run (mirror rehearsal)
+    needs: build
+    runs-on: ubuntu-24.04
+    # The publish pipeline's PR-mode proof. The REAL publish runs only on
+    # the owner's tag dispatch (the release job); everything else
+    # rehearses the full publish into a file:// mirror — the CLI's pin
+    # verification + clean-cache install verify through the mirror
+    # included — and nothing leaves the runner.
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.publish }}
+    env:
+      TEBAKO_CLI: ${{ github.workspace }}/.packager/tebako
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: out
+          merge-multiple: false
+      - name: Restore layout
+        # each dist-<name>-<triplet> artifact carries the leg's dist/
+        # contents (uniquely named files); merge them back into dist/.
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for d in out/dist-*/; do mv "$d"* dist/; rmdir "$d"; done
+          ls -l dist
+      - name: Fetch the publisher (pinned by the recipes, sha256-verified)
+        run: tools/fetch_publisher .packager linux-gnu-x86_64
+      - name: Publish into the mirror + verify (unsigned rehearsal)
+        run: tools/publish --dry-run "$RUNNER_TEMP/publish-mirror" "dryrun-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Assert the mirror + registry shape
+        run: |
+          set -euo pipefail
+          m="$RUNNER_TEMP/publish-mirror/dryrun-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          tfs_n="$(ls "$m"/*.tfs | wc -l | tr -d ' ')"
+          sha_n="$(ls "$m"/*.tfs.sha256 | wc -l | tr -d ' ')"
+          blk_n="$(ls "$m"/*.tfs.blksum.json | wc -l | tr -d ' ')"
+          echo "mirror: $tfs_n images, $sha_n sha256 sidecars, $blk_n blksum sidecars"
+          [ "$tfs_n" = "15" ] && [ "$sha_n" = "15" ] && [ "$blk_n" = "15" ] \
+            || { echo "::error::the mirror must carry 15 artifacts + 15 .sha256 + 15 .blksum.json"; exit 1; }
+          ! ls "$m"/*.asc >/dev/null 2>&1 || { echo "::error::the dry-run must publish unsigned"; exit 1; }
+          "$TEBAKO_CLI" registry validate tpkg-registry.yaml
+          ruby -ryaml -e '
+            reg = YAML.load_file("tpkg-registry.yaml")
+            payloads = reg.fetch("payloads")
+            abort "expected 3 payloads, got #{payloads.length}" unless payloads.length == 3
+            payloads.each do |p|
+              vs = p.fetch("versions")
+              abort "#{p["name"]}: expected 1 version row, got #{vs.length}" unless vs.length == 1
+              plats = vs[0].fetch("platforms")
+              abort "#{p["name"]}: expected 5 platform rows, got #{plats.length}" unless plats.length == 5
+              abort "#{p["name"]}: a dry-run row carries no signature" if vs[0].key?("signature")
+              ref = vs[0].dig("release", "ref").to_s
+              abort "#{p["name"]}: the release ref must name the dry-run tag" unless ref.include?("dryrun-")
+            end
+            puts "registry OK: #{payloads.map { |p| p["name"] }.join(", ")} — 1 version × 5 platforms each"
+          '
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-24.04
+    # The owner's explicit act ONLY (the ecosystem hard rule): a dispatch
+    # with publish=true on a tag ref. Push/tag/PR runs never publish.
+    if: ${{ always() && !cancelled() && inputs.publish && needs.build.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
+    env:
+      TEBAKO_CLI: ${{ github.workspace }}/.packager/tebako
+      TEBAKO_HOME: ${{ github.workspace }}/.tebako
+      TEBAKO_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
+          path: out
+          merge-multiple: false
+      - name: Restore layout
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for d in out/dist-*/; do mv "$d"* dist/; rmdir "$d"; done
+          ls -l dist
+      - name: Fetch the publisher (pinned by the recipes, sha256-verified)
+        run: tools/fetch_publisher .packager linux-gnu-x86_64
+      - name: Restore the published registry from main
+        # Upserts ride the CURRENT main registry, not the tag's tree — a
+        # re-cut tag on an older commit must not resurrect stale rows.
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git show origin/main:tpkg-registry.yaml > tpkg-registry.yaml || true
+      - name: Publish payloads + registry
+        # Signing (the recipes' signing: blocks; spec 09 §9): the CI
+        # signing subkey arrives as org secret TEBAKO_CI_SIGNING_KEY and is
+        # staged into the publisher home's keys/ by tools/publish.
+        # Declared-signing + absent secret fails the publish (fail-closed
+        # before any upload). The publish then uploads every artifact with
+        # its .sha256 / .blksum.json / .asc sidecars and verifies the
+        # published rows with a clean-cache install before the registry
+        # file moves.
+        env:
+          TEBAKO_SIGNING_KEY: ${{ secrets.TEBAKO_CI_SIGNING_KEY }}
+        run: tools/publish "${{ github.ref_name }}"
+      - name: Registry default policy (stable tracks the publish; prerelease never moves it)
+        # Tag grammar (the workflow header): <version>[-<buildno>]. A
+        # version carrying a non-numeric segment after the numeric prefix
+        # (0.2.0rc1) is a PRERELEASE shape — its rows publish like any
+        # other, but the `default:` entries STAY on the latest stable
+        # publish (stable users never resolve onto a pre by default) and
+        # the release object is flagged prerelease so livecheck-style
+        # consumers skip it (the pydata/metanorma policy).
+        env:
+          GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag_base="${{ github.ref_name }}"; tag_base="${tag_base%-*}"
+          if [[ "$tag_base" =~ [^0-9.] ]]; then
+            echo "::notice::prerelease tag $tag_base — flagging the release --prerelease; registry defaults untouched (they track the latest stable publish)"
+            gh release edit "${{ github.ref_name }}" --prerelease
+          else
+            ruby tools/set_registry_defaults.rb
+          fi
+      # main is branch-protected: the registry lands by bot PR +
+      # auto-merge, never by direct push (GH006-refused in this org — the
+      # metanorma/pydata pattern). Idempotent across re-runs of the same
+      # tag.
+      - name: Publish the registry entry via pull request
+        env:
+          # The CI PAT authors the PR: a GITHUB_TOKEN-authored PR's checks
+          # sit on the approval queue until they expire red.
+          GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "tebako-ci"
+          git config user.email "tebako@ribose.com"
+          git fetch origin main
+          if git diff --quiet origin/main -- tpkg-registry.yaml; then
+            echo "registry unchanged (or the entries already landed on main)"
+            exit 0
+          fi
+          branch="publish/${{ github.ref_name }}-registry"
+          git checkout -b "$branch"
+          git add tpkg-registry.yaml
+          git commit -m "publish ${{ github.ref_name }}: registry entries (all recipe platforms)"
+          git push origin "$branch"
+          if ! gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr create --base main --head "$branch" \
+              --title "publish ${{ github.ref_name }}: registry entries" \
+              --body "Automated registry entries for ${{ github.ref_name }} (the build-payload publish job; main is protected, so the registry lands by PR)."
+          fi
+          gh pr merge --auto --squash "$branch" || gh pr merge --squash "$branch"
+
+  ping-registry:
+    # The official registry's 6-hourly aggregate is the self-healing
+    # backstop; this reusable ping (tebako-packages/registry) makes a
+    # same-day publish visible there immediately. Never fatal.
+    if: ${{ inputs.publish && startsWith(github.ref, 'refs/tags/') }}
+    needs: [release]
+    uses: tebako-packages/registry/.github/workflows/ping-aggregate.yml@main
+    secrets: inherit

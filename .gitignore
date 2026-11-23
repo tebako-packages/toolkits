@@ -2,3 +2,6 @@
 work/
 out/
 dist/
+# local publish/dogfood rehearsals (tools/fetch_publisher, key staging)
+.packager/
+.tebako/

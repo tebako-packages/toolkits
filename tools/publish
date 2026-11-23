@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# tools/publish — publish every recipe's staged dist/ artifacts to the
+# feedstock release and upsert the resolved tpkg-registry.yaml.
+#
+#   tools/publish [--dry-run MIRROR_DIR] TAG
+#
+# Real mode (the build-payload publish job, tag dispatch): uploads every
+# artifact + its .sha256 / .blksum.json / .asc sidecars to the release at
+# RELEASE_REF_BASE:TAG, then verifies the published rows with a
+# clean-cache install. Dry-run mode: the same publishes into a file://
+# MIRROR_DIR (<mirror>/<tag>/<artifact>) — the CLI still runs the full
+# pin-verification pass against the mirror and the clean-cache install
+# verify through it (the PR-mode proof; nothing leaves the runner).
+#
+# One `tebako publish` call per recipe, each upserting the same
+# tpkg-registry.yaml in the cwd. Environment:
+#   TEBAKO_CLI           path of the pinned tebako CLI (required; the
+#                        tebako-shim dispatcher must sit beside it —
+#                        tools/fetch_publisher).
+#   TEBAKO_SIGNING_KEY   the armored CI signing subkey (real mode,
+#                        required when the recipes declare signing —
+#                        fail-closed; staged at $TEBAKO_HOME/keys/).
+#   RELEASE_REF_BASE     default tfs:github:tebako-packages/toolkits.
+#   TK_PUBLISH_PLATFORMS space-separated triplet subset (the local
+#                        rehearsal hook; CI never sets it — every recipe
+#                        platform's artifact must be present there).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/lib/common.sh"
+
+DRY_MIRROR=""
+if [ "${1:-}" = "--dry-run" ]; then
+  DRY_MIRROR="${2:?usage: tools/publish [--dry-run MIRROR_DIR] TAG}"
+  shift 2
+fi
+TAG="${1:?usage: tools/publish [--dry-run MIRROR_DIR] TAG}"
+TEBAKO_CLI="${TEBAKO_CLI:?publish: set TEBAKO_CLI to the pinned tebako CLI (tools/fetch_publisher stages it)}"
+RELEASE_REF_BASE="${RELEASE_REF_BASE:-tfs:github:tebako-packages/toolkits}"
+[ -x "$TEBAKO_CLI" ] || { echo "publish: no executable at TEBAKO_CLI=$TEBAKO_CLI" >&2; exit 1; }
+
+# Every recipe must agree on signing: one registry, one signing story.
+SIGNING_KEYID=""
+for recipe in "$HERE"/../recipes/*.yml; do
+  k="$("$HERE/recipe_query" -o "$recipe" signing.keyid)"
+  [ "$k" = "[]" ] && k=""
+  if [ -z "$SIGNING_KEYID" ]; then
+    SIGNING_KEYID="$k"
+  elif [ "$k" != "$SIGNING_KEYID" ]; then
+    echo "publish: signing.keyid drift in $recipe ('$k' vs '$SIGNING_KEYID') — every recipe must sign the same way" >&2
+    exit 1
+  fi
+done
+
+SIGN_ARGS=()
+if [ -n "$SIGNING_KEYID" ]; then
+  if [ -n "$DRY_MIRROR" ]; then
+    echo "publish: dry run — recipes declare signing (keyid $SIGNING_KEYID) but the rehearsal publishes unsigned"
+  else
+    : "${TEBAKO_SIGNING_KEY:?publish: recipes declare signing but TEBAKO_SIGNING_KEY is empty — a signing feedstock never publishes unsigned}"
+    home="${TEBAKO_HOME:-$HOME/.tebako}"
+    mkdir -p "$home/keys"
+    printf '%s\n' "$TEBAKO_SIGNING_KEY" > "$home/keys/ci-signing.key"
+    chmod 600 "$home/keys/ci-signing.key"
+    SIGN_ARGS=(--sign="$SIGNING_KEYID")
+  fi
+else
+  echo "publish: recipes declare no signing — publishing unsigned (unsigned is first-class; the registry carries no signature pins)"
+fi
+
+MIRROR_ARGS=()
+[ -z "$DRY_MIRROR" ] || MIRROR_ARGS=(--upload-mirror "$DRY_MIRROR")
+
+for recipe in "$HERE"/../recipes/*.yml; do
+  name="$("$HERE/recipe_query" "$recipe" name)"
+  version="$("$HERE/recipe_query" "$recipe" upstream.version)"
+  PAYLOAD_ARGS=()
+  # binmode: ucrt64 ruby text mode would emit \r\n and poison the
+  # read -r loop (the same defense as tools/stage's read-back).
+  while IFS= read -r triplet; do
+    triplet="${triplet%$'\r'}"
+    [ -n "$triplet" ] || continue
+    if [ -n "${TK_PUBLISH_PLATFORMS:-}" ]; then
+      case " $TK_PUBLISH_PLATFORMS " in
+        *" $triplet "*) : ;;
+        *) echo "publish: skipping $name $triplet (TK_PUBLISH_PLATFORMS subset)"; continue ;;
+      esac
+    fi
+    art="dist/${name}-${version}-$(asset_infix "$triplet").tfs"
+    [ -f "$art" ] || { echo "publish: missing artifact $art (run the leg's build + stage first)" >&2; exit 1; }
+    PAYLOAD_ARGS+=(--payload "$triplet=$art")
+  done < <("$HERE/recipe_query" "$recipe" platforms | ruby -rjson -e '$stdout.binmode; JSON.parse(STDIN.read).each { |p| puts p }')
+  [ "${#PAYLOAD_ARGS[@]}" -gt 0 ] || { echo "publish: no payloads selected for $name" >&2; exit 1; }
+  echo "publish: $name $version (${#PAYLOAD_ARGS[@]} platform args) → $RELEASE_REF_BASE:$TAG"
+  # SIGN_ARGS carries --sign=<keyid> when the recipes sign and this is not
+  # the rehearsal; the ${arr[@]+...} guard keeps the empty expansion legal
+  # under set -u on bash 3.2 (macOS's /bin/bash).
+  "$TEBAKO_CLI" publish "${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"}" --name "$name" \
+    --release "$RELEASE_REF_BASE:$TAG" \
+    "${PAYLOAD_ARGS[@]}" \
+    "${MIRROR_ARGS[@]+"${MIRROR_ARGS[@]}"}" \
+    --registry-out "$PWD/tpkg-registry.yaml"
+done
+echo "publish: OK — registry at $PWD/tpkg-registry.yaml"
