@@ -36,6 +36,12 @@ tfs_bin() {
   if [ -f "$1/tfs.exe" ]; then printf '%s' "$1/tfs.exe"; else printf '%s' "$1/tfs"; fi
 }
 
+# tebako_bin TOOLSDIR — the leg's verified tebako CLI (tebako.exe on
+# windows-ucrt; the sbom verb's probe/generation binary, toolkits#4).
+tebako_bin() {
+  if [ -f "$1/tebako.exe" ]; then printf '%s' "$1/tebako.exe"; else printf '%s' "$1/tebako"; fi
+}
+
 # pack_image PLATFORM TOOLSDIR ROOT IMAGE — pack ROOT as the payload IMAGE
 # with the leg's verified tfs CLI: `tfs mkimage --format limnifs` (the
 # product's in-process writer; limnifs is the default tebako image
@@ -193,4 +199,31 @@ download_tfs() {
   fi
   fetch_verified "${base}/${asset}" "$want" "${destdir}/tfs${exe}"
   chmod +x "${destdir}/tfs${exe}"
+}
+
+# download_tebako DESTDIR REPO RELEASE TRIPLET EXPECTED_SHA256
+# The tebako CLI twin of download_tfs (toolkits#4): stages
+# tebako-<version>-<infix>[.exe] as tebako[.exe] with the same
+# two-anchor discipline (recipe tools.tebako.sha256.<infix> pin ↔
+# downloaded bytes ↔ the release's own SHA256SUMS). The legs probe its
+# `sbom` verb for the SBOM lane (tebako#1120).
+download_tebako() {
+  local destdir="$1" repo="$2" release="$3" triplet="$4" want="$5"
+  local infix asset base sums got exe
+  infix="$(asset_infix "$triplet")"
+  exe=""; case "$triplet" in *-windows-ucrt) exe=".exe" ;; esac
+  asset="tebako-${release#v}-${infix}${exe}"
+  base="https://github.com/${repo}/releases/download/${release}"
+  sums="${destdir}/SHA256SUMS.${release}"
+  mkdir -p "$destdir"
+  if [ ! -f "$sums" ]; then
+    fetch "${base}/SHA256SUMS" "$sums"
+  fi
+  got="$(awk -v a="$asset" '$2 == a {print $1}' "$sums")"
+  if [ "$got" != "$want" ]; then
+    echo "download_tebako: pin mismatch for $asset: recipe=$want release=${got:-ABSENT}" >&2
+    return 1
+  fi
+  fetch_verified "${base}/${asset}" "$want" "${destdir}/tebako${exe}"
+  chmod +x "${destdir}/tebako${exe}"
 }

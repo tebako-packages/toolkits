@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# tools/sign_sboms — attach + sign the legs' SBOMs on the release
+# (toolkits#4, replicating the metanorma#168 feedstock template).
+#
+#   tools/sign_sboms TAG
+#
+# Each leg generated its CycloneDX 1.6 SBOM from the recipe's hashed
+# upstream provenance via the pinned CLI's sbom verb (tools/stage —
+# complete mode: every component carries purl + sha256) into dist/.
+# The publish ships it beside the payload with the SAME treatment as
+# every other signed name: a detached .asc from the CI signing subkey
+# (the offline GPG lane — the same TEBAKO_CI_SIGNING_KEY material
+# `tebako publish --sign` consumes; gpg is the detached-sign instrument
+# for files the CLI does not itself sign). Skip-if-current like the
+# CLI's own uploads — never a blanket --clobber. A tools pin predating
+# the verb stages no SBOMs and the step skips LOUDLY (the pin roll is
+# the activation, never a workflow edit).
+#
+# Environment:
+#   GH_TOKEN           gh api/gh release upload credentials.
+#   TEBAKO_SIGNING_KEY the armored CI signing subkey (required when the
+#                      recipes declare signing — fail-closed, the
+#                      tools/publish rule).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/lib/common.sh"
+
+TAG="${1:?usage: sign_sboms TAG}"
+REPO="${GITHUB_REPOSITORY:-tebako-packages/toolkits}"
+
+shopt -s nullglob
+sboms=(dist/*.cdx.json)
+if [ ${#sboms[@]} -eq 0 ]; then
+  echo "::notice::no .cdx.json in dist/ — the legs' pinned tools predated the sbom verb (tebako#1120); the SBOM publish activates with the tools pin roll (toolkits#4)"
+  exit 0
+fi
+
+# Signing is DECLARED by the recipes (their signing: blocks): a signing
+# feedstock never ships an unsigned SBOM silently — fail closed before
+# any upload, the publish step's own rule. Every recipe must agree (the
+# tools/publish loop).
+SIGNING_KEYID=""
+for recipe in "$HERE"/../recipes/*.yml; do
+  k="$("$HERE/recipe_query" -o "$recipe" signing.keyid)"
+  [ "$k" = "[]" ] && k=""
+  if [ -z "$SIGNING_KEYID" ]; then
+    SIGNING_KEYID="$k"
+  elif [ "$k" != "$SIGNING_KEYID" ]; then
+    echo "sign_sboms: signing.keyid drift in $recipe ('$k' vs '$SIGNING_KEYID') — every recipe must sign the same way" >&2
+    exit 1
+  fi
+done
+[ -n "$SIGNING_KEYID" ] || { echo "::error::sign_sboms: the recipes declare no signing keyid — sign or drop the SBOMs, never publish them unsigned"; exit 1; }
+: "${TEBAKO_SIGNING_KEY:?sign_sboms: SIGNING_KEYID declared but TEBAKO_SIGNING_KEY is empty — a signing feedstock never publishes unsigned}"
+command -v gpg >/dev/null 2>&1 || { echo "::error::sign_sboms: gpg not on PATH — the .asc lane needs it"; exit 1; }
+
+export GNUPGHOME="${TMPDIR:-/tmp}/sign-sboms-gnupg.$$"
+trap 'rm -rf "$GNUPGHOME"' EXIT
+mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+printf '%s\n' "$TEBAKO_SIGNING_KEY" | gpg --batch --import
+
+for f in "${sboms[@]}"; do
+  gpg --batch --yes --pinentry-mode loopback \
+    --local-user "$SIGNING_KEYID" \
+    --detach-sign --armor --output "$f.asc" "$f"
+  for side in "$f" "$f.asc"; do
+    name="$(basename "$side")"
+    want="$(sha256_of "$side")"
+    have="$(gh api "repos/${REPO}/releases/tags/${TAG}" \
+      --jq ".assets[] | select(.name == \"$name\") | .digest" | sed 's/^sha256://')"
+    if [ "$have" = "$want" ]; then
+      echo "$name is already current on the release — skipping"
+    else
+      gh release upload "$TAG" "$side" --clobber
+    fi
+  done
+done
