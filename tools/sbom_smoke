@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# tools/sbom_smoke — the SBOM acceptance proof, continuous (toolkits#4;
+# tebako#1124's universal acceptance): osv-scanner PARSES every staged
+# SBOM in dist/. Report-only by the lane's own contract — a parse
+# failure warns loudly, never fails the publish. The tool is pinned by
+# the recipes' sbom.osv_scanner blocks and sha256-verified at fetch,
+# cross-checked against the release's own osv-scanner_SHA256SUMS
+# (tools/fetch_osv_scanner — the tebako tools fetch's discipline).
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/lib/common.sh"
+
+shopt -s nullglob
+sboms=(dist/*.cdx.json)
+if [ ${#sboms[@]} -eq 0 ]; then
+  echo "::notice::no SBOMs staged — the smoke no-ops (the tools pin predates the sbom verb; toolkits#4)"
+  exit 0
+fi
+
+"$HERE/fetch_osv_scanner" .tools
+.tools/osv-scanner --version
+
+for f in "${sboms[@]}"; do
+  echo "== osv-scanner: $(basename "$f")"
+  rc=0
+  # -L (scan lockfile): v2's spelling — SBOMs ride the lockfile path;
+  # the deprecated --sbom warns. rc 0 = parsed, clean; rc 1 = parsed,
+  # findings reported; anything else = the parse itself failed (warned
+  # loudly below, never fatal).
+  .tools/osv-scanner scan source -L "$f" --format=table 2>&1 || rc=$?
+  case "$rc" in
+    0|1) echo "parse OK (rc=$rc: 0 = no findings, 1 = findings reported — report-only)" ;;
+    *) echo "::warning::osv-scanner could not parse $(basename "$f") (rc=$rc) — report-only, the publish continues" ;;
+  esac
+done

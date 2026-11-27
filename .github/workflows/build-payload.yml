@@ -3,6 +3,17 @@ name: build-payload
 # artifacts, then the publish legs. Conventions: docs/conventions.md in
 # tebako-packages/index.
 #
+# ALL legs — the SBOM lane (toolkits#4, replicating the metanorma#168
+# feedstock template): tools/stage's tail generates the leg's per-tool
+# CycloneDX 1.6 SBOM from the recipe's hashed upstream provenance via
+# the pinned CLI's sbom verb (tebako#1120 — complete mode: one
+# `<name>-<version> <sha256>` closure row per leg, ecosystem generic),
+# and the publish job attaches it + signs it (.asc, the CI signing
+# subkey — tools/sign_sboms) + pins the registry sidecar
+# (tools/render_sbom_sidecars.rb) + runs the report-only osv-scanner
+# smoke (tools/sbom_smoke). A tools pin predating the verb skips LOUDLY
+# — activation is the pin roll, never a workflow edit.
+#
 # Publish: the owner's explicit act — dispatch this workflow ON THE TAG
 # with publish=true (the ecosystem hard rule: push/PR/tag runs build +
 # gate only, they never publish). The publish-dry-run job is the same
@@ -224,6 +235,41 @@ jobs:
         env:
           TEBAKO_SIGNING_KEY: ${{ secrets.TEBAKO_CI_SIGNING_KEY }}
         run: tools/publish "${{ github.ref_name }}"
+      # The SBOM publish (toolkits#4 — replicating the metanorma#168
+      # feedstock template; tebako#1124's standing rules): each leg
+      # generated its per-tool CycloneDX 1.6 SBOM from the recipe's
+      # hashed upstream provenance via the pinned CLI's sbom verb
+      # (tools/stage — complete mode: every component carries purl +
+      # sha256) into dist/. The publish ships it beside the payload
+      # with the SAME treatment as every other signed name: a detached
+      # .asc from the CI signing subkey, skip-if-current against the
+      # release's own served digests. A tools pin predating the verb
+      # stages no SBOMs and the step skips LOUDLY (the pin roll is the
+      # activation, never a workflow edit). YAML stays thin — the logic
+      # lives in tools/.
+      - name: Attach + sign the payload SBOMs (toolkits#4)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TEBAKO_SIGNING_KEY: ${{ secrets.TEBAKO_CI_SIGNING_KEY }}
+        run: tools/sign_sboms "${{ github.ref_name }}"
+      # The registry rows' SBOM sidecar (toolkits#4): the additive
+      # `sbom: {artifact, sha256}` pin per platform entry, re-rendered
+      # from the release's own served digests AFTER the publish step's
+      # CLI upsert — the upsert round-trips its serde model and drops
+      # unknown keys, so the pins re-derive at every publish (the L3
+      # mirror-by-value rule). Pre-SBOM readers ignore the key (the
+      # registry evolution law — verified with the sbom-carrying CLI's
+      # `registry validate`).
+      - name: Pin the SBOM sidecars in the registry rows (toolkits#4)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ruby tools/render_sbom_sidecars.rb "${{ github.repository }}"
+      # The acceptance proof, continuous (toolkits#4; tebako#1124's
+      # universal acceptance): osv-scanner PARSES every staged SBOM.
+      # Report-only by the lane's own contract — a parse failure warns
+      # loudly, never fails the publish.
+      - name: SBOM smoke — osv-scanner parses (report-only)
+        run: tools/sbom_smoke
       - name: Registry default policy (stable tracks the publish; prerelease never moves it)
         # Tag grammar (the workflow header): <version>[-<buildno>]. A
         # version carrying a non-numeric segment after the numeric prefix

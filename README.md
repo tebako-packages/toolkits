@@ -123,10 +123,14 @@ Every shipped binary was inspected, not assumed:
 - `tools/` — the build machine: `emit_matrix` (one CI leg per
   recipe × platform), `build` (fetch → verify → stage → `tfs mkimage`),
   `boot_smoke` (extract-and-run the recipe's `smoke:` contract),
-  `stage` (embed the manifest, repack, read-back-validate, sidecar),
+  `stage` (embed the manifest, repack, read-back-validate, sidecar +
+  the per-tool SBOM — the SBOM lane below),
   `fetch_publisher` (the pinned tebako CLI + shim, sha256-verified),
   `publish` (per-recipe `tebako publish` → release + registry upsert;
   `--dry-run` rehearses into a file:// mirror),
+  `sign_sboms` + `render_sbom_sidecars.rb` + `sbom_smoke` +
+  `fetch_osv_scanner` (the publish job's SBOM attach/sign, registry
+  sidecar pins, and report-only parse smoke),
   `set_registry_defaults.rb`, `recipe_query`, `lib/common.sh`.
 - `manifests/payload.yaml` — the spec-03 manifest template `stage` fills.
 - `tpkg-registry.yaml` — the feedstock's resolved registry (spec 04 §2).
@@ -148,6 +152,8 @@ $ tools/build recipes/jq.yml 1.8.2 aarch64-macos
 $ tools/boot_smoke out/jq/aarch64-macos recipes/jq.yml
 $ tools/stage out/jq/aarch64-macos aarch64-macos recipes/jq.yml
 # dist/jq-1.8.2-macos-arm64.tfs (+ .manifest.yaml sidecar)
+# dist/jq-1.8.2-macos-arm64.cdx.json (when the pinned tools carry the
+# sbom verb — tebako#1120; a loud skip notice on older pins)
 ```
 
 ## Publishing (the owner's act)
@@ -179,6 +185,60 @@ Every other run of the workflow exercises the same pipeline as
 `publish-dry-run`: a full publish into a file:// mirror — the CLI's pin
 verification and clean-cache install verify through the mirror included
 — with nothing leaving the runner.
+
+## The SBOM lane (toolkits#4 — the metanorma#168 feedstock template)
+
+Every leg emits one `<tool>-<version>-<asset-platform>.cdx.json`
+(CycloneDX 1.6) PER TOOL PER TRIPLET into `dist/`, and the publish job
+ships it beside the payload with the same trust treatment as every
+other served name. tebako#1124's standing rules bind: components carry
+**purl + sha256**.
+
+- **Generation (per leg, tools/stage's tail).** The pinned CLI's `sbom`
+  verb (tebako#1120) in COMPLETE mode: `tebako sbom <payload.tfs>
+  --closure <one-row> --ecosystem generic --triplet <triplet>`. **The
+  input of record is the recipe's own hashed provenance** — a repack
+  feedstock's closure is the per-triplet upstream asset pin
+  (`upstream.assets.<triplet>.sha256`, the very digest `fetch_verified`
+  + `cross_check_sums` anchored at fetch time), rendered to the verb's
+  closure grammar as the single row `<name>-<version> <sha256>`. The
+  ecosystem word is **generic**: a native binary maps to
+  `pkg:generic/<name>@<version>` (CycloneDX component type
+  `application`). Deterministic — `SOURCE_DATE_EPOCH` pinned at the
+  feedstock commit (spec 13 §5a); two runs on unchanged inputs are
+  byte-identical. **Activation is the pin, never a workflow edit**: an
+  older tools pin probes out (`unknown command 'sbom'`) and the step
+  skips LOUDLY until the automated pin roll brings a release carrying
+  the verb.
+- **Why not the degraded in-image mode.** The verb's closure-less
+  inventory reads `specifications/*.gemspec` — a rubygems layout a
+  native-binary image never carries (verified locally: the refusal is
+  the named exit 65). Every tool here HAS a hashed provenance pin, so
+  complete mode is the honest answer everywhere in this feedstock; the
+  degraded mode would be a fabrication, not a fallback.
+- **Signing (the offline GPG lane).** `tools/sign_sboms` produces a
+  detached `.cdx.json.asc` with the SAME CI signing subkey material
+  `tebako publish --sign` consumes (`TEBAKO_CI_SIGNING_KEY`, the
+  recipes' `signing.keyid`) — fail-closed when signing is declared and
+  the secret is absent, before any upload; skip-if-current against the
+  release's own served digests. This feedstock has **no sigstore
+  attestation lane** for any served name — the SBOM rides the same
+  `.asc` treatment, and attestation is a named follow-up for the
+  publish job as a whole.
+- **The registry sidecar.** Each platform entry (per tool, per triplet)
+  gains the additive `sbom: {artifact, sha256}` pin, re-rendered from
+  the release's OWN served digests by `tools/render_sbom_sidecars.rb`
+  at every publish — the L3 mirror-by-value rule, because the CLI's
+  registry upsert round-trips its serde model and drops unknown keys.
+  Pre-SBOM readers ignore the key (the registry evolution law; verified
+  with the sbom-carrying CLI's `registry validate`).
+- **The smoke (report-only, never fails).** `tools/sbom_smoke` runs
+  osv-scanner over every staged SBOM — tebako#1124's universal
+  acceptance proof (parse OK / findings reported). osv-scanner is
+  pinned in every recipe's `sbom.osv_scanner` block (agreement enforced
+  by `tools/fetch_osv_scanner`, the fetch_publisher doctrine),
+  sha256-verified at fetch and cross-checked against the release's own
+  `osv-scanner_SHA256SUMS`.
 
 ## Limits (this increment, honestly)
 
